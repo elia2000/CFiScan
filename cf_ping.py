@@ -151,6 +151,7 @@ refusals     = []                     # entries of the latest consecutive refusa
 last_refusal = [""]                   # reason text of the most recent one
 refusal_lock = threading.Lock()
 REFUSAL_LIMIT = 3
+stop_notes   = []                     # why the run stopped early; printed again in the final summary
 done_ips_set = set()
 done_lock    = threading.Lock()
 last_save    = 0.0
@@ -1078,10 +1079,10 @@ def resolve_targets(candidates, cfg, args):
                 print(f"    {CGR}skipped {n}{R}")
             setattr(args, "down_target" if not upload else "up_target", chosen)
         else:
-            print(f"  {CR}{B}✘ No {kind} test server answers your server:{R}")
-            for n in notes:
-                print(f"    {CY}{n}{R}")
+            lines = [f"{CR}{B}✘ No {kind} test server answers your server:{R}"] + [f"  {CY}{n}{R}" for n in notes]
+            print("\n".join("  " + l for l in lines))
             if not upload:
+                stop_notes.extend(lines)
                 return False
             print(f"  {CY}  Continuing WITHOUT the upload test (give --up-url a server that accepts POST, or silence this with --no-upload){R}")
             args.no_upload = True
@@ -1104,7 +1105,9 @@ def run_speed_test_phase(candidates, args, cfg):
         if not resolve_targets(candidates, cfg, args):
             last_refusal[0] = "no download test server answered (see list above)"
             host_refuses.set()
-            print(f"\n  {CW}These IPs were NOT judged. Try --down-url with a large file your server can fetch.{R}\n")
+            hint = f"{CW}These IPs were NOT judged. Run again with --down-url <a large file your server can fetch>.{R}"
+            stop_notes.append(hint)
+            print(f"\n  {hint}\n")
             return
     ul_txt = "" if args.no_upload else " + upload"
     print(f"\n  {CM}{B}▸ Real speed test of {len(candidates)} IPs through your VLESS tunnel "
@@ -1159,10 +1162,12 @@ def run_speed_test_phase(candidates, args, cfg):
             _, not_done = wait(not_done, timeout=0.3)
 
     if host_refuses.is_set():
-        print(f"\n  {CR}{B}✘ The speed-test URL refuses our requests ({REFUSAL_LIMIT} in a row):{R}\n"
-              f"    {CY}{last_refusal[0]}{R}\n"
-              f"    {CW}Your server (or Cloudflare) blocks it. Stopping - these IPs were NOT judged.\n"
-              f"    Pick another test server with --down-url / --up-url (see README), or --no-upload.{R}\n")
+        lines = [f"{CR}{B}✘ The speed-test URL refuses our requests ({REFUSAL_LIMIT} in a row):{R}",
+                 f"  {CY}{last_refusal[0]}{R}",
+                 f"{CW}Your server (or the test server) blocks it. These IPs were NOT judged.{R}",
+                 f"{CW}Pick another test server with --down-url / --up-url (see README), or --no-upload.{R}"]
+        stop_notes.extend(lines)
+        print("\n" + "\n".join("  " + l for l in lines) + "\n")
         return
     with stats["lock"]:
         passed, slow, failed = stats["passed"], stats["slow"], stats["failed"]
@@ -1325,6 +1330,14 @@ def run(args):
     except ValueError as e:
         print(f"  {CR}  {e}{R}"); sys.exit(1)
 
+    for opt, url in (("--verify-url", args.verify_url), ("--down-url", args.down_url), ("--up-url", args.up_url)):
+        host = urllib.parse.urlsplit(url or "").hostname or ""
+        if (host in ("example.com", "example.org", "example.net")
+                or host.endswith((".example.com", ".example.org", ".example.net", ".invalid", ".example", ".test"))):
+            print(f"  {CR}  {opt} {url}\n  {host} is a placeholder from the README, not a real server - "
+                  f"use a URL of a large file that really exists.{R}")
+            sys.exit(1)
+
     if args.tls13_only and not args.sni:
         print(f"  {CR}  --tls13-only requires -s/--sni{R}"); sys.exit(1)
     if args.speed_test and (not cfg or args.ping_only):
@@ -1467,10 +1480,16 @@ def run(args):
         s = dict(stats)
 
     verb = ("Stopped by Ctrl+C" if shutdown.is_set()
-            else "Stopped: the speed-test URL refuses requests (see message above)" if host_refuses.is_set()
+            else "Stopped: no usable speed-test server" if host_refuses.is_set()
             else f"Stopped: found the {args.want} IPs you wanted" if want_reached.is_set()
             else "Scan complete")
-    print(f"\n  {CG}{B}✔ {verb}!{R}\n")
+    if host_refuses.is_set():
+        print(f"\n  {CR}{B}✘ {verb}{R}\n")
+        for l in stop_notes:
+            print(f"  {l}")
+        print()
+    else:
+        print(f"\n  {CG}{B}✔ {verb}!{R}\n")
     print(f"  {CW}{'Total IPs':<26}{R}{CY}{B}{s['total']:>10,}{R}")
     print(f"  {CW}{'Processed':<26}{R}{CC}{B}{s['processed']:>10,}{R}")
     if cfg:

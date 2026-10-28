@@ -177,10 +177,12 @@ continues **without** the upload test and says so. Public test files can move or
 (a big file on your server or CDN is best):
 
 ```bash
-python3 cf_ping.py subnets.txt -c "vless://..." --speed-test --down-url "https://example.com/100mb.bin" --no-upload
+python3 cf_ping.py subnets.txt -c "vless://..." --speed-test --down-url "https://your-server.invalid/100mb.bin" --no-upload
 ```
 
 `--down-url` / `--up-url` force a single URL — no fallback. `--up-url` needs a server that accepts `POST` bodies.
+`your-server.invalid` above is a **placeholder** — replace it with a real file URL (the script refuses placeholder
+hosts such as `example.com`).
 
 ## Limitations
 

@@ -225,7 +225,7 @@ V2rayN مقدار MB/s را نشان می‌دهد. عبارت `7.25 Mbps (0.91 
 <div dir="ltr">
 
 ```bash
-python3 cf_ping.py subnets.txt -c "vless://..." --speed-test --down-url "https://example.com/100mb.bin" --no-upload
+python3 cf_ping.py subnets.txt -c "vless://..." --speed-test --down-url "https://your-server.invalid/100mb.bin" --no-upload
 ```
 
 </div>
@@ -234,6 +234,8 @@ python3 cf_ping.py subnets.txt -c "vless://..." --speed-test --down-url "https:/
 
 `--down-url` / `--up-url` فقط **یک** آدرس را اجباری می‌کنند — بدون جایگزین. `--up-url` باید سروری باشد که بدنه‌ی
 `POST` را قبول می‌کند.
+عبارت `your-server.invalid` در مثال بالا فقط **جای‌نگهدار** است — آن را با آدرس یک فایل واقعی عوض کنید (اسکریپت
+هاست‌های جای‌نگهدار مثل `example.com` را قبول نمی‌کند).
 
 ## محدودیت‌ها
 
