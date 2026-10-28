@@ -45,10 +45,10 @@ Speed-test options (need -c):
   --want N        Stop everything as soon as N IPs passed (default: 0 = scan all)
   --sort          download | upload | delay                   (default: download)
   --loss-count    ICMP pings per IP for packet loss, 0 = off  (default: 0)
-  --down-url      Download URL, {bytes} = request size the script picks
-                   (default: https://speed.cloudflare.com/__down?bytes={bytes})
-  --up-url        Upload URL, must accept POST bodies
-                   (default: https://speed.cloudflare.com/__up)
+  --down-url      Force ONE download URL ({bytes} = request size the script picks).
+                   Default: automatic - the first of Cloudflare's speed server and a few
+                   public test files that your server can really reach
+  --up-url        Force ONE upload URL (must accept POST bodies). Default: automatic
 
 Hopeless IPs are dropped early (a few seconds), only IPs that pass the download
 test get the upload test, and rejected IPs never reach the result list.
@@ -112,8 +112,15 @@ BANNER = (
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 VERIFY_URL   = "https://cp.cloudflare.com/generate_204"           # scan-stage check, light enough for thousands of hits
-DOWN_URL     = "https://speed.cloudflare.com/__down?bytes={bytes}"   # {bytes} = request size, chosen by the script
-UP_URL       = "https://speed.cloudflare.com/__up"
+# Speed-test servers, tried in this order (once per run, through the tunnel) until one answers.
+# {bytes} in a URL = request size chosen by the script; other URLs are plain files.
+DOWN_URLS    = ["https://speed.cloudflare.com/__down?bytes={bytes}",
+                "https://speed.hetzner.de/100MB.bin",
+                "https://cachefly.cachefly.net/100mb.test",
+                "http://speedtest.tele2.net/100MB.zip",
+                "https://proof.ovh.net/files/100Mb.dat"]
+UP_URLS      = ["https://speed.cloudflare.com/__up",
+                "http://speedtest.tele2.net/upload.php"]
 UA           = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 WS_GUID      = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -500,16 +507,22 @@ def _refused(st, status, hdrs, rest):
     Shows server / cf-mitigated headers and the start of the body, e.g.
     HTTP 403 [server: cloudflare] "error code: 1020"
     """
-    try:    body, reusable = _read_body(st, hdrs, rest, 200), hdrs.get("connection", "").lower() != "close"
-    except Exception: body, reusable = rest[:200], False
+    try:    body, reusable = _read_body(st, hdrs, rest, 400), hdrs.get("connection", "").lower() != "close"
+    except Exception: body, reusable = rest[:400], False
     bits = [f"{k}: {hdrs[k]}" for k in ("server", "cf-mitigated", "retry-after", "location") if k in hdrs]
-    text = " ".join(body.decode("latin-1").split())[:80]
+    text = body.decode("latin-1")
+    if "chunked" in hdrs.get("transfer-encoding", "").lower():
+        text = re.sub(r"^[0-9a-fA-F]+\r\n", "", text)                     # chunk-size line
+    title = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+    text  = " ".join((title.group(1) if title else text).split())[:80]
     note = f"HTTP {status}" + (f" [{'; '.join(bits)}]" if bits else "") + (f' "{text}"' if text else "")
     return TunnelError(note), reusable
 
 def _request(method, target, path, extra=""):
+    if target["host"] == "speed.cloudflare.com":      # what the official speed-test page sends
+        extra += "Referer: https://speed.cloudflare.com/\r\nOrigin: https://speed.cloudflare.com\r\n"
     return (f"{method} {path} HTTP/1.1\r\nHost: {target['hostport']}\r\nUser-Agent: {UA}\r\n"
-            f"Accept: */*\r\n{extra}\r\n").encode()
+            f"Accept: */*\r\nAccept-Language: en-US,en;q=0.9\r\n{extra}\r\n").encode()
 
 def verify_tunnel(tun, target):
     """Real-delay check (like V2rayN's): a request to `target` through the tunnel must be answered."""
@@ -759,8 +772,8 @@ def parse_args():
     ap.add_argument("--no-ping",       action="store_true",        help=argparse.SUPPRESS)  # old flag, ICMP pre-check is gone
     ap.add_argument("--no-verify",     action="store_true",        help="Only check the WS 101 handshake, skip the real tunnel check")
     ap.add_argument("--verify-url",    default=VERIFY_URL,         help=f"URL fetched through the tunnel to verify each hit (default:{VERIFY_URL})")
-    ap.add_argument("--down-url",      default=DOWN_URL,           help=f"Download URL for speed tests, {{bytes}} = request size (default:{DOWN_URL})")
-    ap.add_argument("--up-url",        default=UP_URL,             help=f"Upload URL for speed tests, must accept POST bodies (default:{UP_URL})")
+    ap.add_argument("--down-url",      default=None,               help="Download URL for speed tests, {bytes} = request size (default: automatic - first working of Cloudflare's speed server and public test files)")
+    ap.add_argument("--up-url",        default=None,               help="Upload URL for speed tests, must accept POST bodies (default: automatic)")
     ap.add_argument("--speed-test",    action="store_true",        help="Every --speed-limit verified hits, pause the scan and measure real download/upload through the tunnel")
     ap.add_argument("--speed-limit",   type=int,   default=20,     help="Verified hits per speed-test batch (default:20)")
     ap.add_argument("--speed-time",    type=float, default=5.0,    help="Seconds per download / upload measurement (default:5)")
@@ -1009,6 +1022,71 @@ def result_processor(result_q, args, cfg, scan_id, stop_evt, pause_evt):
             result_q.task_done()
 
 # ─── Speed-test phase ─────────────────────────────────────────────────────────
+def probe_target(ip, cfg, args, target, upload):
+    """Does `target` answer a request from the user's server, through a tunnel over `ip`?
+    Raises TunnelError("HTTP ...") if the URL refuses us, any other error if the tunnel itself failed."""
+    tun = VlessWS(ip, cfg, max(args.wait, 5.0))
+    try:
+        tun.connect()
+        st = open_stream(tun, target)
+        tun.sock.settimeout(STALL_SECS)
+        if upload:
+            st.write(_request("POST", target, target["path"],
+                              f"Content-Type: application/octet-stream\r\nContent-Length: {UP_MIN}\r\n"
+                              f"Connection: close\r\n") + _UP_BODY[:UP_MIN])
+            status, hdrs, rest = _http_head(st)
+            if status not in (200, 201, 202, 204):
+                raise _refused(st, status, hdrs, rest)[0]
+        else:
+            st.write(_request("GET", target, target["path"].replace("{bytes}", str(DOWN_FIRST)),
+                              "Connection: close\r\n"))
+            status, hdrs, rest = _http_head(st)
+            if status != 200:
+                raise _refused(st, status, hdrs, rest)[0]
+            if not rest and not st.read():
+                raise TunnelError("HTTP 200 but empty body")
+    finally:
+        tun.close()
+
+def resolve_targets(candidates, cfg, args):
+    """
+    Pick, once per run, the first download (and upload) URL that the user's server can really
+    use - the server behind the tunnel is what talks to it, so every edge IP shares the answer.
+    Returns False when no download URL works.
+    """
+    ips = [e["ip"] for e in candidates[:3]]          # a second/third IP only if the tunnel itself hiccups
+    for kind, cands, upload in (("download", args.down_candidates, False), ("upload", args.up_candidates, True)):
+        if upload and args.no_upload:
+            continue
+        chosen, notes = None, []
+        for target in cands:
+            for ip in ips:
+                try:
+                    probe_target(ip, cfg, args, target, upload)
+                    chosen = target
+                except Exception as e:
+                    note = _note(e)
+                    notes.append(f"{target['host']}: {note}")
+                    if note.startswith("HTTP "):      # the URL refuses us - no point asking via other IPs
+                        break
+                    continue
+                break
+            if chosen: break
+        if chosen:
+            print(f"  {CG}▸ {kind} test server:{R} {CW}{chosen['url']}{R}")
+            for n in notes:
+                print(f"    {CGR}skipped {n}{R}")
+            setattr(args, "down_target" if not upload else "up_target", chosen)
+        else:
+            print(f"  {CR}{B}✘ No {kind} test server answers your server:{R}")
+            for n in notes:
+                print(f"    {CY}{n}{R}")
+            if not upload:
+                return False
+            print(f"  {CY}  Continuing WITHOUT the upload test (give --up-url a server that accepts POST, or silence this with --no-upload){R}")
+            args.no_upload = True
+    return True
+
 def fmt_speed(v):
     return "    -" if v is None else f"{v:6.2f} Mbps ({v/8:5.2f} MB/s)"
 
@@ -1021,6 +1099,13 @@ def run_speed_test_phase(candidates, args, cfg):
     if not candidates:
         return
     candidates = sorted(candidates, key=lambda e: e.get("tunnel_ms") or e.get("latency_ms") or 9999)
+    if args.down_target is None:
+        print(f"\n  {CM}{B}▸ Looking for a speed-test server your server can reach (through the tunnel)…{R}")
+        if not resolve_targets(candidates, cfg, args):
+            last_refusal[0] = "no download test server answered (see list above)"
+            host_refuses.set()
+            print(f"\n  {CW}These IPs were NOT judged. Try --down-url with a large file your server can fetch.{R}\n")
+            return
     ul_txt = "" if args.no_upload else " + upload"
     print(f"\n  {CM}{B}▸ Real speed test of {len(candidates)} IPs through your VLESS tunnel "
           f"(download{ul_txt}, {args.speed_time:g}s each, min {args.min_download:g}"
@@ -1234,8 +1319,9 @@ def run(args):
 
     try:
         args.verify_target = parse_url(args.verify_url)
-        args.down_target   = parse_url(args.down_url)
-        args.up_target     = parse_url(args.up_url)
+        args.down_candidates = [parse_url(u) for u in ([args.down_url] if args.down_url else DOWN_URLS)]
+        args.up_candidates   = [parse_url(u) for u in ([args.up_url] if args.up_url else UP_URLS)]
+        args.down_target = args.up_target = None          # chosen by resolve_targets() before the first speed test
     except ValueError as e:
         print(f"  {CR}  {e}{R}"); sys.exit(1)
 
