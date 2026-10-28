@@ -32,7 +32,7 @@ SNI / Host / path / UUID:
 | Stage | What is checked | Cost |
 |---|---|---|
 | 1. Scan | TCP + TLS + WebSocket upgrade must return a real `101` (valid `Sec-WebSocket-Accept`) | cheap, high parallelism |
-| 2. Tunnel check | A VLESS request to `speed.cloudflare.com` and an HTTPS request **through the tunnel** must succeed — like V2rayN's "real delay" | a few round trips, only for stage-1 hits |
+| 2. Tunnel check | An HTTPS request to `cp.cloudflare.com/generate_204` **through the tunnel** must succeed — like V2rayN's "real delay" | a few round trips, only for stage-1 hits |
 | 3. Download | Download through the tunnel for `--speed-time` seconds. Slow IPs are dropped after ~2.5 s | one IP at a time |
 | 4. Upload | Only for IPs that passed 3. Chunks are POSTed through the tunnel and **only counted once the server acknowledged them** | one IP at a time |
 
@@ -87,7 +87,9 @@ The script prints **Mbps** (megabits/s) and, next to it, **MB/s** (megabytes/s, 
 | `-o, --output` | `cf_results.json` | Results file |
 | `-r, --resume` | `cf_progress.json` | Progress file (see *Resume*) |
 | `--no-verify` | off | Only check the WebSocket `101` (fast, but many such IPs carry no traffic) |
-| `--test-host` | `speed.cloudflare.com` | Advanced: host reached *through the tunnel*. It must serve Cloudflare's `/__down?bytes=` and `/__up` endpoints |
+| `--verify-url` | `https://cp.cloudflare.com/generate_204` | URL fetched *through the tunnel* to verify every hit (a `200`/`204` answer is expected) |
+| `--down-url` | `https://speed.cloudflare.com/__down?bytes={bytes}` | Download URL for speed tests. `{bytes}` is the request size the script picks; a plain file URL works too. `http://` and `https://` both work |
+| `--up-url` | `https://speed.cloudflare.com/__up` | Upload URL for speed tests; must accept `POST` bodies |
 | `--speed-test` | off | Real download/upload test of the verified hits (needs `-c`) |
 | `--speed-limit` | 20 | Verified hits that trigger a speed-test batch (the scan pauses meanwhile) |
 | `--speed-time` | 5 | Seconds per download and per upload measurement |
@@ -137,7 +139,7 @@ automatically the next time you resume.
 
 `cf_progress.json` stores which IPs were already scanned, `cf_results.json` what was found. Run the same command
 again to continue. Both files belong to **one config + mode**: change the config (UUID, host, path, SNI, port,
-`--no-verify`, `--test-host`) and the old progress is ignored and the scan starts fresh. Use `-o` / `-r` to keep
+`--no-verify`, `--verify-url`) and the old progress is ignored and the scan starts fresh. Use `-o` / `-r` to keep
 several scans side by side.
 
 ---
@@ -147,10 +149,28 @@ several scans side by side.
 | Symptom | Likely cause |
 |---|---|
 | Every IP: `HTTP 400/404 (wrong path/config?)` | Wrong `path`, `host` or `sni` in the link |
-| `WS ok, tunnel dead: …` for everything | Wrong UUID, your server is down, or your server cannot reach `speed.cloudflare.com`. `--no-verify` shows whether the edge answers at all (those IPs are *not* proven to work) |
+| `WS ok, tunnel dead: …` for everything | Wrong UUID, your server is down, or your server cannot reach the `--verify-url` host. `--no-verify` shows whether the edge answers at all (those IPs are *not* proven to work) |
+| `rejected: download: HTTP 403 [server: cloudflare] …` | The speed-test URL refuses requests from your server (blocked datacenter IP, rate limit or size limit). The script then stops after 3 in a row and leaves the IPs **untested**. The text after `HTTP 403` is what the server answered. Use another URL, see below |
 | `fake WS 101` | Something in the network is faking WebSocket replies |
 | Speeds still higher than V2rayN | V2rayN measures another URL and duration; other traffic on your line; try `--speed-time 10`. Compare IPs against each other, not the absolute value |
 | `ping` not found | Linux minimal images: `sudo apt install iputils-ping` (only needed for `--ping-only` / `--loss-count`) |
+
+### If the speed test is refused (HTTP 403 …)
+
+The default test server is Cloudflare's `speed.cloudflare.com`. Your **server** (the one behind the tunnel) makes
+that request, so its IP can be blocked or rate-limited there. The script already starts with small requests
+(2 MB) and only grows them while the server accepts it. If it still says `HTTP 403`, point the speed test at
+any other large file / upload endpoint that your server can reach:
+
+```bash
+python3 cf_ping.py subnets.txt -c "vless://..." --speed-test --down-url "https://example.com/100mb.bin" --no-upload
+```
+
+* `--down-url` can be any `http://` or `https://` file bigger than a few MB (a file on your own server or CDN is best;
+  public test files such as `https://cachefly.cachefly.net/100mb.test` or `http://speedtest.tele2.net/100MB.zip` are
+  often used, but their availability changes). If you use `{bytes}` in the URL it is replaced by the request size.
+* `--up-url` needs a server that accepts `POST` bodies; if you have none, use `--no-upload`.
+* Send the line after `HTTP 403 …` to whoever helps you debug — it shows the server's answer.
 
 ## Limitations
 

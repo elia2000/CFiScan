@@ -29,7 +29,8 @@ Scan options:
   --tls13-only    Save only TLS 1.3 IPs (needs --sni)
   --no-verify     Only check the WebSocket 101 handshake (fast, but many of
                    those IPs do NOT carry traffic - not recommended)
-  --test-host     Host reached through the tunnel   (default: speed.cloudflare.com)
+  --verify-url    URL fetched THROUGH the tunnel to verify every hit
+                   (default: https://cp.cloudflare.com/generate_204)
 
 Speed-test options (need -c):
   --speed-test    Every --speed-limit tunnel-verified hits, PAUSE the scan, measure
@@ -44,6 +45,10 @@ Speed-test options (need -c):
   --want N        Stop everything as soon as N IPs passed (default: 0 = scan all)
   --sort          download | upload | delay                   (default: download)
   --loss-count    ICMP pings per IP for packet loss, 0 = off  (default: 0)
+  --down-url      Download URL, {bytes} = request size the script picks
+                   (default: https://speed.cloudflare.com/__down?bytes={bytes})
+  --up-url        Upload URL, must accept POST bodies
+                   (default: https://speed.cloudflare.com/__up)
 
 Hopeless IPs are dropped early (a few seconds), only IPs that pass the download
 test get the upload test, and rejected IPs never reach the result list.
@@ -106,12 +111,14 @@ BANNER = (
 )
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-TEST_HOST    = "speed.cloudflare.com"   # destination reached THROUGH the tunnel
+VERIFY_URL   = "https://cp.cloudflare.com/generate_204"           # scan-stage check, light enough for thousands of hits
+DOWN_URL     = "https://speed.cloudflare.com/__down?bytes={bytes}"   # {bytes} = request size, chosen by the script
+UP_URL       = "https://speed.cloudflare.com/__up"
 UA           = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 WS_GUID      = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WS_FRAME     = 16384                    # max WebSocket payload per frame we send
-DOWN_BYTES   = 100_000_000              # asked from /__down; we stop reading at the time limit
+DOWN_FIRST, DOWN_FLOOR, DOWN_MAX, DOWN_TARGET = 2_000_000, 1_000_000, 100_000_000, 1.5   # download request size / target secs
 PROBE_SECS   = 2.5                      # after this long, speeds below half the minimum are aborted
 STALL_SECS   = 4.0                      # no data for this long during a transfer = dead
 UP_MIN, UP_MAX, UP_TARGET = 64 * 1024, 4 * 1024 * 1024, 1.5   # upload request size / target secs
@@ -132,6 +139,11 @@ LOG_MAXLEN   = 14
 log_lock     = threading.Lock()
 shutdown     = threading.Event()      # Ctrl+C
 want_reached = threading.Event()      # --want N satisfied
+host_refuses = threading.Event()      # the speed-test URLs keep answering HTTP errors
+refusals     = []                     # entries of the latest consecutive refusals
+last_refusal = [""]                   # reason text of the most recent one
+refusal_lock = threading.Lock()
+REFUSAL_LIMIT = 3
 done_ips_set = set()
 done_lock    = threading.Lock()
 last_save    = 0.0
@@ -418,10 +430,31 @@ class TunnelTLS:
             if self._eof: return b""
             raise
 
-def open_tls_stream(tun, host):
-    """Ask the proxy server for host:443 and do TLS to it, all through the tunnel."""
-    tun.set_dest(host, 443)
-    st = TunnelTLS(tun, host)
+def parse_url(u):
+    """Split an http(s) URL into what is needed to reach it through the tunnel."""
+    p = urllib.parse.urlsplit(u)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise ValueError(f"not an http(s) URL: {u}")
+    tls = p.scheme == "https"
+    return {"url": u, "tls": tls, "host": p.hostname, "port": p.port or (443 if tls else 80),
+            "hostport": p.netloc.rpartition("@")[2],
+            "path": (p.path or "/") + ("?" + p.query if p.query else "")}
+
+class PlainStream:
+    """Unencrypted (http://) destination carried inside the tunnel; same interface as TunnelTLS."""
+    def __init__(self, tunnel):
+        self.t = tunnel
+    def write(self, data):
+        self.t.send(data)
+    def read(self, n=65536):
+        return self.t.recv()
+
+def open_stream(tun, target):
+    """Ask the proxy server for target host:port and, for https, do TLS to it - all through the tunnel."""
+    tun.set_dest(target["host"], target["port"])
+    if not target["tls"]:
+        return PlainStream(tun)
+    st = TunnelTLS(tun, target["host"])
     st.handshake()
     return st
 
@@ -442,63 +475,102 @@ def _http_head(st):
     hdrs = {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in lines[1:])}
     return int(parts[1]), hdrs, rest
 
-def _drain_body(st, hdrs, rest):
+def _read_body(st, hdrs, rest, keep=0):
+    """Consume the rest of a reply body (so the connection can be reused); returns its first `keep` bytes."""
+    body = bytearray(rest[:keep])
     if "content-length" in hdrs:
         left = int(hdrs["content-length"]) - len(rest)
         while left > 0:
             chunk = st.read(min(left, 65536))
             if not chunk: raise TunnelError("closed during reply")
             left -= len(chunk)
+            body += chunk[:max(0, keep - len(body))]
     elif "chunked" in hdrs.get("transfer-encoding", "").lower():
         tail = rest[-8:]
         while not tail.endswith(b"0\r\n\r\n"):
             chunk = st.read()
             if not chunk: raise TunnelError("closed during reply")
+            body += chunk[:max(0, keep - len(body))]
             tail = (tail + chunk)[-8:]
+    return bytes(body)
 
-def _get(host, path, extra=""):
-    return (f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {UA}\r\n"
+def _refused(st, status, hdrs, rest):
+    """
+    A reply that is not what we asked for -> (error saying WHY, connection still usable?).
+    Shows server / cf-mitigated headers and the start of the body, e.g.
+    HTTP 403 [server: cloudflare] "error code: 1020"
+    """
+    try:    body, reusable = _read_body(st, hdrs, rest, 200), hdrs.get("connection", "").lower() != "close"
+    except Exception: body, reusable = rest[:200], False
+    bits = [f"{k}: {hdrs[k]}" for k in ("server", "cf-mitigated", "retry-after", "location") if k in hdrs]
+    text = " ".join(body.decode("latin-1").split())[:80]
+    note = f"HTTP {status}" + (f" [{'; '.join(bits)}]" if bits else "") + (f' "{text}"' if text else "")
+    return TunnelError(note), reusable
+
+def _request(method, target, path, extra=""):
+    return (f"{method} {path} HTTP/1.1\r\nHost: {target['hostport']}\r\nUser-Agent: {UA}\r\n"
             f"Accept: */*\r\n{extra}\r\n").encode()
 
-def verify_tunnel(tun, host):
-    """Real-delay check: an HTTPS request to `host` through the tunnel must work."""
-    st = open_tls_stream(tun, host)
-    st.write(_get(host, "/__down?bytes=1024", "Connection: close\r\n"))
-    status, _, _ = _http_head(st)
-    if status != 200:
-        raise TunnelError(f"HTTP {status} from {host}")
-
-def tunnel_download(st, host, window, min_mbps):
-    """
-    Download through the tunnel for at most `window` seconds. Speed = bytes actually
-    received / time since the request was sent (stalls and slow start count against it).
-    """
-    t0 = now()
-    st.write(_get(host, f"/__down?bytes={DOWN_BYTES}", "Connection: close\r\n"))
+def verify_tunnel(tun, target):
+    """Real-delay check (like V2rayN's): a request to `target` through the tunnel must be answered."""
+    st = open_stream(tun, target)
+    st.write(_request("GET", target, target["path"], "Connection: close\r\n"))
     status, hdrs, rest = _http_head(st)
-    if status != 200:
-        raise TunnelError(f"HTTP {status} from {host}")
-    total = int(hdrs["content-length"]) if hdrs.get("content-length", "").isdigit() else None
-    got   = len(rest)
+    if status not in (200, 204):
+        raise _refused(st, status, hdrs, rest)[0]
+
+def tunnel_download(st, target, window, min_mbps):
+    """
+    Download through the tunnel for at most `window` seconds in keep-alive requests.
+    Speed = bytes actually received / time since the first request (gaps between requests,
+    stalls and slow start all count against it). With a {bytes} placeholder in the URL the
+    request size starts small, follows the speed, and shrinks when the server refuses a
+    big size, so a size limit on the test server never kills a test.
+    """
+    t0, got = now(), 0
+    sized = "{bytes}" in target["path"]
+    size, cap, refusals = DOWN_FIRST, DOWN_MAX, 0
     while True:
-        if shutdown.is_set(): raise TunnelError("aborted")
-        el = now() - t0
-        if el >= window: break
-        if el >= PROBE_SECS and mbps(got, el) < min_mbps / 2:
-            raise TooSlow(mbps(got, el))
-        chunk = st.read(65536)
-        if not chunk:
-            if total is not None and got < total:
-                raise TunnelError("download cut off")
-            break
-        got += len(chunk)
-        if total is not None and got >= total:       # whole file arrived before the time limit
-            break
+        if now() - t0 >= window: break
+        t1 = now()
+        try:
+            st.write(_request("GET", target, target["path"].replace("{bytes}", str(size)),
+                              "Connection: keep-alive\r\n"))
+            status, hdrs, rest = _http_head(st)
+        except (TunnelError, OSError):
+            if got: break                      # server closed after the first request: use what we have
+            raise
+        if status != 200:
+            err, reusable = _refused(st, status, hdrs, rest)
+            refusals += 1
+            if not (sized and reusable) or size <= DOWN_FLOOR or refusals > 3:
+                raise err
+            cap = size = max(DOWN_FLOOR, size // 4)       # too big for this server: back off
+            continue
+        total = int(hdrs["content-length"]) if hdrs.get("content-length", "").isdigit() else None
+        left  = None if total is None else total - len(rest)
+        got  += len(rest)
+        done  = False
+        while left is None or left > 0:
+            if shutdown.is_set(): raise TunnelError("aborted")
+            el = now() - t0
+            if el >= window:
+                done = True; break
+            if el >= PROBE_SECS and mbps(got, el) < min_mbps / 2:
+                raise TooSlow(mbps(got, el))
+            chunk = st.read(65536)
+            if not chunk:
+                if left is not None: raise TunnelError("download cut off")
+                done = True; break             # body without length ended with the connection
+            got += len(chunk)
+            if left is not None: left -= len(chunk)
+        if done: break
+        size = int(min(cap, max(DOWN_FIRST, (total or size) / max(now() - t1, 1e-3) * DOWN_TARGET)))
     if got == 0:
         raise TunnelError("no data received")
     return mbps(got, now() - t0)
 
-def tunnel_upload(st, host, window, min_mbps):
+def tunnel_upload(st, target, window, min_mbps):
     """
     Upload through the tunnel in acknowledged POSTs. A chunk only counts once the server
     has answered it, so data still sitting in socket buffers is never counted as speed.
@@ -515,16 +587,16 @@ def tunnel_upload(st, host, window, min_mbps):
         sock.settimeout(max(1.0, window + STALL_SECS - el))
         t1 = now()
         try:
-            st.write((f"POST /__up HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {UA}\r\n"
-                      f"Content-Type: application/octet-stream\r\nContent-Length: {size}\r\n"
-                      f"Connection: keep-alive\r\n\r\n").encode() + _UP_BODY[:size])
+            st.write(_request("POST", target, target["path"],
+                              f"Content-Type: application/octet-stream\r\nContent-Length: {size}\r\n"
+                              f"Connection: keep-alive\r\n") + _UP_BODY[:size])
             status, hdrs, rest = _http_head(st)
-            _drain_body(st, hdrs, rest)
+            if status not in (200, 201, 202, 204):
+                raise _refused(st, status, hdrs, rest)[0]
+            _read_body(st, hdrs, rest)
         except socket.timeout:
             if sent: break                       # keep what was acknowledged so far
             raise TunnelError("upload stalled")
-        if status not in (200, 201, 204):
-            raise TunnelError(f"HTTP {status} (upload)")
         t_ack  = now()
         sent  += size
         rate   = size / max(t_ack - t1, 1e-3)    # bytes/s of this request
@@ -536,8 +608,8 @@ def tunnel_upload(st, host, window, min_mbps):
 def test_config(ip, cfg, args):
     """
     Scan-stage test: TCP + TLS + WS upgrade with the config's SNI/Host/path (must be a
-    real 101), then - unless --no-verify - an HTTPS request to the test host THROUGH
-    the VLESS tunnel. Only IPs that pass both are reported as good.
+    real 101), then - unless --no-verify - a request to --verify-url THROUGH the VLESS
+    tunnel. Only IPs that pass both are reported as good.
     """
     res   = {"ip": ip, "method": None, "port": cfg["port"]}
     stage = "ws"
@@ -550,7 +622,7 @@ def test_config(ip, cfg, args):
             res.update(method="ws", note="WS 101 ✔ (tunnel not verified)")
             return res
         stage = "tunnel"
-        verify_tunnel(tun, args.test_host)
+        verify_tunnel(tun, args.verify_target)
         res.update(method="ws", tunnel_ms=round((now() - t0) * 1000, 1), note="tunnel ✔")
     except Exception as e:
         res["note"] = _note(e)
@@ -563,23 +635,23 @@ def test_config(ip, cfg, args):
 
 def measure_ip(ip, cfg, args):
     """
-    Real speed of one IP: a fresh VLESS tunnel to the test host for the download, and
-    another for the upload (only if the download was good enough). Returns the fields
-    to merge into the result entry.
+    Real speed of one IP: a fresh VLESS tunnel to the download URL for the download, and
+    another to the upload URL for the upload (only if the download was good enough).
+    Returns the fields to merge into the result entry.
     """
-    def run(fn, *a):
+    def run(fn, target, *a):
         tun = VlessWS(ip, cfg, max(args.wait, 5.0))
         try:
             tun.connect()
-            st = open_tls_stream(tun, args.test_host)
+            st = open_stream(tun, target)
             tun.sock.settimeout(STALL_SECS)
-            return fn(st, args.test_host, *a)
+            return fn(st, target, *a)
         finally:
             tun.close()
 
     out = {"verdict": "pass", "reason": ""}
     try:
-        out["download_mbps"] = round(run(tunnel_download, args.speed_time, args.min_download), 2)
+        out["download_mbps"] = round(run(tunnel_download, args.down_target, args.speed_time, args.min_download), 2)
     except TooSlow as e:
         return {"download_mbps": round(e.mbps, 2), "verdict": "slow", "reason": f"download {e}"}
     except Exception as e:
@@ -590,7 +662,7 @@ def measure_ip(ip, cfg, args):
     if args.no_upload:
         return out
     try:
-        out["upload_mbps"] = round(run(tunnel_upload, args.speed_time, args.min_upload), 2)
+        out["upload_mbps"] = round(run(tunnel_upload, args.up_target, args.speed_time, args.min_upload), 2)
     except TooSlow as e:
         out.update(upload_mbps=round(e.mbps, 2), verdict="slow", reason=f"upload {e}")
         return out
@@ -686,7 +758,9 @@ def parse_args():
     ap.add_argument("--tls13-only",    action="store_true",        help="TLS 1.3 only filter")
     ap.add_argument("--no-ping",       action="store_true",        help=argparse.SUPPRESS)  # old flag, ICMP pre-check is gone
     ap.add_argument("--no-verify",     action="store_true",        help="Only check the WS 101 handshake, skip the real tunnel check")
-    ap.add_argument("--test-host",     default=TEST_HOST,          help=f"Host reached through the tunnel (default:{TEST_HOST})")
+    ap.add_argument("--verify-url",    default=VERIFY_URL,         help=f"URL fetched through the tunnel to verify each hit (default:{VERIFY_URL})")
+    ap.add_argument("--down-url",      default=DOWN_URL,           help=f"Download URL for speed tests, {{bytes}} = request size (default:{DOWN_URL})")
+    ap.add_argument("--up-url",        default=UP_URL,             help=f"Upload URL for speed tests, must accept POST bodies (default:{UP_URL})")
     ap.add_argument("--speed-test",    action="store_true",        help="Every --speed-limit verified hits, pause the scan and measure real download/upload through the tunnel")
     ap.add_argument("--speed-limit",   type=int,   default=20,     help="Verified hits per speed-test batch (default:20)")
     ap.add_argument("--speed-time",    type=float, default=5.0,    help="Seconds per download / upload measurement (default:5)")
@@ -734,7 +808,7 @@ def make_scan_id(args, cfg):
         "cfg":    [cfg[k] for k in ("uuid", "port", "ws_host", "path", "sni", "security")] if cfg else None,
         "mode":   "ping" if args.ping_only else "cfg" if cfg else "tls" if args.sni else "tcp",
         "sni":    args.sni, "port": args.port, "t13": args.tls13_only,
-        "verify": not args.no_verify, "host": args.test_host,
+        "verify": not args.no_verify, "host": args.verify_url,
     }
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:12]
 
@@ -954,7 +1028,7 @@ def run_speed_test_phase(candidates, args, cfg):
           f"{args.speed_threads} at a time)…{R}\n")
 
     def _job(entry):
-        if shutdown.is_set() or want_reached.is_set():
+        if shutdown.is_set() or want_reached.is_set() or host_refuses.is_set():
             return
         try:
             res = measure_ip(entry["ip"], cfg, args)
@@ -972,6 +1046,19 @@ def run_speed_test_phase(candidates, args, cfg):
             stats[{"pass": "passed", "slow": "slow", "fail": "failed"}[v]] += 1
             if v == "pass" and args.want and stats["passed"] >= args.want:
                 want_reached.set()
+        refused = v == "fail" and res.get("reason", "").startswith(("download: HTTP", "upload: HTTP"))
+        with refusal_lock:
+            if refused: last_refusal[0] = res["reason"]
+            refusals.append(entry) if refused else refusals.clear()
+            tripped = len(refusals) >= REFUSAL_LIMIT and not host_refuses.is_set()
+            if tripped:
+                host_refuses.set()
+                with alive_lock:        # that was the test host's doing, not the IPs': test them again later
+                    for e in refusals:
+                        for k in ("verdict", "reason", "download_mbps", "upload_mbps"):
+                            e.pop(k, None)
+                with stats["lock"]:
+                    stats["failed"] -= len(refusals); stats["untested"] += len(refusals)
         with print_lock:
             tls = entry.get("tls") or "-"
             if v == "pass":
@@ -986,6 +1073,12 @@ def run_speed_test_phase(candidates, args, cfg):
         while not_done:                  # short timeouts keep Ctrl+C responsive on Windows
             _, not_done = wait(not_done, timeout=0.3)
 
+    if host_refuses.is_set():
+        print(f"\n  {CR}{B}✘ The speed-test URL refuses our requests ({REFUSAL_LIMIT} in a row):{R}\n"
+              f"    {CY}{last_refusal[0]}{R}\n"
+              f"    {CW}Your server (or Cloudflare) blocks it. Stopping - these IPs were NOT judged.\n"
+              f"    Pick another test server with --down-url / --up-url (see README), or --no-upload.{R}\n")
+        return
     with stats["lock"]:
         passed, slow, failed = stats["passed"], stats["slow"], stats["failed"]
     print(f"\n  {CG}{B}✔ Batch done — {passed} passed in total, "
@@ -1049,7 +1142,7 @@ def render(args, cfg):
              f"{CGR}Timeout:{R}{CW}{args.wait}s{R}")
     if cfg:
         how = (f"{CY}WS handshake only (--no-verify){R}" if args.no_verify
-               else f"{CG}real VLESS tunnel via {args.test_host}{R}")
+               else f"{CG}real VLESS tunnel via {args.verify_target['host']}{R}")
         L.append(f"  {CGR}Verify:{R} {how}")
     L.append("")
     L.append(f"  {B}{CW}Progress{R}  {progress_bar(frac)}  {CY}{B}{frac*100:6.2f}%{R}\n")
@@ -1138,6 +1231,13 @@ def run(args):
             print(f"  {CY}⚠  --no-verify: IPs are only checked for a WS 101 reply and may not carry traffic{R}")
     elif not args.sni and not args.ping_only:
         print(f"  {CY}⚠  No config (-c) or SNI (-s) given → TCP-only mode{R}\n")
+
+    try:
+        args.verify_target = parse_url(args.verify_url)
+        args.down_target   = parse_url(args.down_url)
+        args.up_target     = parse_url(args.up_url)
+    except ValueError as e:
+        print(f"  {CR}  {e}{R}"); sys.exit(1)
 
     if args.tls13_only and not args.sni:
         print(f"  {CR}  --tls13-only requires -s/--sni{R}"); sys.exit(1)
@@ -1233,7 +1333,7 @@ def run(args):
             pending   = set()
             exhausted = False
 
-            while not shutdown.is_set() and not want_reached.is_set():
+            while not (shutdown.is_set() or want_reached.is_set() or host_refuses.is_set()):
                 if pause_evt is not None and pause_evt.is_set():
                     if pending:
                         done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
@@ -1266,7 +1366,7 @@ def run(args):
     result_q.join()
     stop_proc.set(); pt.join(timeout=3)
 
-    if args.speed_test and not shutdown.is_set() and not want_reached.is_set():
+    if args.speed_test and not (shutdown.is_set() or want_reached.is_set() or host_refuses.is_set()):
         render_pause.set()
         time.sleep(0.6)
         clear_screen(); print(BANNER)
@@ -1281,6 +1381,7 @@ def run(args):
         s = dict(stats)
 
     verb = ("Stopped by Ctrl+C" if shutdown.is_set()
+            else "Stopped: the speed-test URL refuses requests (see message above)" if host_refuses.is_set()
             else f"Stopped: found the {args.want} IPs you wanted" if want_reached.is_set()
             else "Scan complete")
     print(f"\n  {CG}{B}✔ {verb}!{R}\n")
