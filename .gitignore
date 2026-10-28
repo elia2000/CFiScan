@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# scan output / resume files (default names)
+cf_results.json
+cf_progress.json
+*.json.tmp
