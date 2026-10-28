@@ -33,8 +33,9 @@ SNI / Host / path / UUID:
 |---|---|---|
 | 1. Scan | TCP + TLS + WebSocket upgrade must return a real `101` (valid `Sec-WebSocket-Accept`) | cheap, high parallelism |
 | 2. Tunnel check | An HTTPS request to `cp.cloudflare.com/generate_204` **through the tunnel** must succeed — like V2rayN's "real delay" | a few round trips, only for stage-1 hits |
-| 3. Download | Download through the tunnel for `--speed-time` seconds. Slow IPs are dropped after ~2.5 s | one IP at a time |
-| 4. Upload | Only for IPs that passed 3. Chunks are POSTed through the tunnel and **only counted once the server acknowledged them** | one IP at a time |
+| 3. Quick screen | Before each speed-test batch: can the IP's tunnel pull even 64 KB within 4 s? Dead or throttled IPs are common and are dropped here, **8 at a time** | seconds, in parallel |
+| 4. Download | Download through the tunnel for `--speed-time` seconds. Slow IPs are dropped after ~2.5 s | one IP at a time |
+| 5. Upload | Only for IPs that passed 4. Chunks are POSTed through the tunnel and **only counted once the server acknowledged them** | one IP at a time |
 
 IPs that fail any stage are never put in the result list, so you only look at IPs that carry real traffic.
 
@@ -78,7 +79,7 @@ The script prints **Mbps** (megabits/s) and, next to it, **MB/s** (megabytes/s, 
 
 | Option | Default | Meaning |
 |---|---|---|
-| `subnets_file` | – | File with IPs / CIDR ranges, one per line (`#` = comment) |
+| `subnets_file` | – | File with IPs / CIDR ranges, one per line (`#` = comment) — or just one IP / CIDR, handy to re-test a single IP |
 | `-c, --config` | – | Your `vless://` link. Needed for tunnel checks and speed tests |
 | `-s, --sni` | – | TLS-only scan for a domain (no config) |
 | `-t, --threads` | 50 | Parallel scan threads |
@@ -88,7 +89,7 @@ The script prints **Mbps** (megabits/s) and, next to it, **MB/s** (megabytes/s, 
 | `-r, --resume` | `cf_progress.json` | Progress file (see *Resume*) |
 | `--no-verify` | off | Only check the WebSocket `101` (fast, but many such IPs carry no traffic) |
 | `--verify-url` | `https://cp.cloudflare.com/generate_204` | URL fetched *through the tunnel* to verify every hit (a `200`/`204` answer is expected) |
-| `--down-url` | automatic | Force **one** download URL for speed tests (`http://` or `https://`). `{bytes}` is the request size the script picks; a plain file URL works too. Default: automatic, see below |
+| `--down-url` | automatic | Force **one** download URL for speed tests (`http://` or `https://`). `{bytes}` in it is replaced by the request size the script picks (it starts at 2,000,000 bytes and adapts to your speed); a plain file URL works too. Default: automatic, see below |
 | `--up-url` | automatic | Force **one** upload URL for speed tests; must accept `POST` bodies |
 | `--speed-test` | off | Real download/upload test of the verified hits (needs `-c`) |
 | `--speed-limit` | 20 | Verified hits that trigger a speed-test batch (the scan pauses meanwhile) |
@@ -150,6 +151,8 @@ several scans side by side.
 |---|---|
 | Every IP: `HTTP 400/404 (wrong path/config?)` | Wrong `path`, `host` or `sni` in the link |
 | `WS ok, tunnel dead: …` for everything | Wrong UUID, your server is down, or your server cannot reach the `--verify-url` host. `--no-verify` shows whether the edge answers at all (those IPs are *not* proven to work) |
+| `download: no reply from … within 4s` / `no data for 4s (N KB had arrived)` / `timeout while connecting to …` | The IP's tunnel stalls or is too slow to even start; the text says at which step. These IPs are useless for you |
+| `⚠ Upload tests switched OFF` | The upload test got no reply on 3 IPs in a row and never worked in this run — see above |
 | `No download test server answers your server` | Every speed-test server refused or was unreachable from your server. The text after each host is what it answered. Give `--down-url` a large file your server can fetch. The IPs stay **untested** |
 | `fake WS 101` | Something in the network is faking WebSocket replies |
 | Speeds still higher than V2rayN | V2rayN measures another URL and duration; other traffic on your line; try `--speed-time 10`. Compare IPs against each other, not the absolute value |
@@ -159,9 +162,8 @@ several scans side by side.
 
 The traffic of a speed test goes **from your server** (the one behind the tunnel) to a test server, so what matters
 is what *your server* can reach. Cloudflare's own `speed.cloudflare.com` sometimes refuses such requests
-(`HTTP 403` or an HTML `404` page for datacenter IPs). That is why, before the first batch, the script tries these
-servers **once per run, through your tunnel**, and uses the first one that answers — the same server for every IP, so
-the numbers stay comparable:
+(`HTTP 403` or an HTML `404` page for datacenter IPs). So the script tries these servers in order, **through your
+tunnel**, and uses the first one that answers — the same server for every IP, so the numbers stay comparable:
 
 | | Download | Upload |
 |---|---|---|
@@ -171,10 +173,20 @@ the numbers stay comparable:
 | 4 | `speedtest.tele2.net/100MB.zip` | |
 | 5 | `proof.ovh.net/files/100Mb.dat` | |
 
-The skipped servers and the reason (status, `server:` header and page title) are printed, e.g.
-`skipped speed.cloudflare.com: HTTP 404 [server: cloudflare] "404 Not Found"`. If no upload server works the script
-continues **without** the upload test and says so. Public test files can move or disappear; to use your own
-(a big file on your server or CDN is best):
+How a server gets dropped:
+
+* **It refuses us** (an HTTP error such as `403`/`404`): it refuses every IP alike, so it is dropped for the whole run
+  and the next one is used. The reason is printed (status, `server:` header, page title), e.g.
+  `skipped speed.cloudflare.com: HTTP 404 [server: cloudflare] "404 Not Found"`.
+* **It times out:** that is blamed on the IP — unless no server has worked yet, then the next server is tried for that
+  IP too. As soon as one server worked, the earlier silent ones are dropped.
+* **No download server answers at all:** the run stops and the IPs stay **untested** (they are not judged).
+* **Upload never works** (the first 3 IPs that passed download all got no reply from every upload server): upload
+  tests are switched **off** with a warning, those IPs count as passed by download, and the run goes on. This usually
+  means your own uplink is the limit. If instead every IP is rejected for a *slow* upload, you get a hint to lower
+  `--min-upload` or use `--no-upload`.
+
+Public test files can move or disappear; to use your own (a big file on your server or CDN is best):
 
 ```bash
 python3 cf_ping.py subnets.txt -c "vless://..." --speed-test --down-url "https://your-server.invalid/100mb.bin" --no-upload
