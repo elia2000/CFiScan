@@ -155,7 +155,10 @@ several scans side by side.
 | Every IP: `HTTP 400/404 (wrong path/config?)` | Wrong `path`, `host` or `sni` in the link |
 | `WS ok, tunnel dead: …` for everything | Wrong UUID, your server is down, or your server cannot reach the `--verify-url` host. `--no-verify` shows whether the edge answers at all (those IPs are *not* proven to work) |
 | `download: no reply from … within 4s` / `no data for 4s (N KB had arrived)` / `timeout while connecting to …` | The IP's tunnel stalls or is too slow to even start; the text says at which step. These IPs are useless for you |
-| `⚠ Upload tests switched OFF` | The upload test got no reply on 3 IPs in a row and never worked in this run — see above |
+| `32 KB went out but <host> sent no reply in 5s` | The data left your PC but that upload server never answered — public servers often ignore datacenter IPs. Use your own server, see above |
+| `uplink stuck: only 16 of 32 KB went out in 5s` | The data does not even leave your PC through this IP: your uplink, or the path through this IP, is blocked or extremely slow |
+| `⚠ Upload tests switched OFF` | The upload test failed on 3 IPs in a row and never worked in this run; the warning lists what the IPs said — see above |
+| `N of N IPs failed the same way` | Nearly every IP fails identically: the test server (or your VPS) is the problem, not the IPs. The run stops and the IPs stay untested |
 | `No download test server answers your server` | Every speed-test server refused or was unreachable from your server. The text after each host is what it answered. Give `--down-url` a large file your server can fetch. The IPs stay **untested** |
 | `fake WS 101` | Something in the network is faking WebSocket replies |
 | Speeds still higher than V2rayN | V2rayN measures another URL and duration; other traffic on your line; try `--speed-time 10`. Compare IPs against each other, not the absolute value |
@@ -172,8 +175,8 @@ tunnel**, and uses the first one that answers — the same server for every IP, 
 |---|---|---|
 | 1 | `speed.cloudflare.com/__down` | `speed.cloudflare.com/__up` |
 | 2 | `speed.hetzner.de/100MB.bin` | `speedtest.tele2.net/upload.php` |
-| 3 | `cachefly.cachefly.net/100mb.test` | |
-| 4 | `speedtest.tele2.net/100MB.zip` | |
+| 3 | `cachefly.cachefly.net/100mb.test` | `httpbin.org/post` (echoes the body: measures up + down) |
+| 4 | `speedtest.tele2.net/100MB.zip` | `postman-echo.com/post` (same) |
 | 5 | `proof.ovh.net/files/100Mb.dat` | |
 
 How a server gets dropped:
@@ -184,12 +187,48 @@ How a server gets dropped:
 * **It times out:** that is blamed on the IP — unless no server has worked yet, then the next server is tried for that
   IP too. As soon as one server worked, the earlier silent ones are dropped.
 * **No download server answers at all:** the run stops and the IPs stay **untested** (they are not judged).
-* **Upload never works** (the first 3 IPs that passed download all got no reply from every upload server): upload
-  tests are switched **off** with a warning, those IPs count as passed by download, and the run goes on. This usually
-  means your own uplink is the limit. If instead every IP is rejected for a *slow* upload, you get a hint to lower
-  `--min-upload` or use `--no-upload`.
+* **Upload never works** (the first 3 IPs that passed download all failed on every upload server): upload tests are
+  switched **off** with a warning that lists **what the IPs said**, those IPs count as passed by download, and the run
+  goes on. If instead every IP is rejected for a *slow* upload, you get a hint to lower `--min-upload` or use
+  `--no-upload`.
+* **Every IP fails the quick screen the same way:** that points at the test server or your VPS, not the IPs — the run
+  stops and the IPs stay untested.
 
-Public test files can move or disappear; to use your own (a big file on your server or CDN is best):
+How the upload is measured: a tiny first POST measures the round-trip time, then requests grow quickly (starting at
+32 KB, so a poor uplink can finish them). A chunk counts only once the server **answered** it, and the bandwidth is
+estimated from the transfer part of each request, so a long round trip does not make a fast uplink look slow. A stall
+tells you where it happened: `uplink stuck: only 16 of 32 KB went out` (the data did not leave your PC) or
+`32 KB went out but <host> sent no reply` (the server did not answer).
+
+### Test against your own server (most accurate)
+
+Public test servers are third parties: they may refuse, throttle or simply ignore a VPS (`HTTP 403/404`, or *"32 KB
+went out but speed.cloudflare.com sent no reply"*). The most reliable alternative is a tiny test server on **your own
+VPS** — the server behind your VLESS config. It then measures exactly what differs between Cloudflare IPs: *your PC →
+Cloudflare IP → your VPS*.
+
+1. Copy `speedtest_server.py` to the VPS and start it (Python 3.8+, no packages). Keep it running (`tmux`,
+   `nohup python3 speedtest_server.py &`, or a systemd service):
+
+   ```bash
+   python3 speedtest_server.py            # listens on 127.0.0.1:8080
+   ```
+
+2. On your PC, point the speed test at it:
+
+   ```bash
+   python3 cf_ping.py subnets.txt -c "vless://..." --speed-test \
+       --down-url "http://127.0.0.1:8080/down?bytes={bytes}" --up-url "http://127.0.0.1:8080/up"
+   ```
+
+`127.0.0.1` is the VPS itself — the VPS opens that connection, not your PC. If your Xray config blocks private
+addresses (a common `geoip:private` → `block` rule), start the server with `--bind 0.0.0.0` and use the VPS's public IP
+in both URLs, and block that port from outside in your firewall (the server answers anybody). It does not measure the
+VPS → internet leg, which is the same for every Cloudflare IP anyway.
+
+### Your own file or another server
+
+Public test files can move or disappear; to use a file on your own server or CDN:
 
 ```bash
 python3 cf_ping.py subnets.txt -c "vless://..." --speed-test --down-url "https://your-server.invalid/100mb.bin" --no-upload

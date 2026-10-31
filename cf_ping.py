@@ -49,6 +49,8 @@ Speed-test options (need -c):
                    Default: automatic - the first of Cloudflare's speed server and a few
                    public test files that your server can really reach
   --up-url        Force ONE upload URL (must accept POST bodies). Default: automatic
+                   Most accurate: run speedtest_server.py on YOUR VPS and point both
+                   URLs at it (see README "Test against your own server")
 
 A quick parallel screen drops dead/throttled IPs first, hopeless IPs are dropped early
 (a few seconds), only IPs that pass the download
@@ -121,7 +123,9 @@ DOWN_URLS    = ["https://speed.cloudflare.com/__down?bytes={bytes}",
                 "http://speedtest.tele2.net/100MB.zip",
                 "https://proof.ovh.net/files/100Mb.dat"]
 UP_URLS      = ["https://speed.cloudflare.com/__up",
-                "http://speedtest.tele2.net/upload.php"]
+                "http://speedtest.tele2.net/upload.php",
+                "https://httpbin.org/post",             # the last two echo the body back, so they measure up + down
+                "https://postman-echo.com/post"]
 UA           = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 WS_GUID      = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -129,7 +133,8 @@ WS_FRAME     = 16384                    # max WebSocket payload per frame we sen
 DOWN_FIRST, DOWN_FLOOR, DOWN_MAX, DOWN_TARGET = 2_000_000, 1_000_000, 100_000_000, 1.5   # download request size / target secs
 PROBE_SECS   = 2.5                      # after this long, speeds below half the minimum are aborted
 STALL_SECS   = 4.0                      # no data for this long during a transfer = dead
-UP_MIN, UP_MAX, UP_TARGET = 64 * 1024, 4 * 1024 * 1024, 1.5   # upload request size / target secs
+UP_CAL, UP_FIRST, UP_MAX = 4 * 1024, 32 * 1024, 4 * 1024 * 1024   # upload request sizes: a tiny calibration POST, then small, growing
+UP_TARGET, UP_FIRST_WAIT = 1.2, 5.0                   # aim for requests of about UP_TARGET s; patience for the first replies
 PRESCREEN_THREADS, PRESCREEN_BYTES, PRESCREEN_SECS, PRESCREEN_MIN = 8, 64 * 1024, 4.0, 3   # quick screen before the speed test
 UPLOAD_GIVEUP = 3                       # IPs in a row whose upload stalled everywhere -> upload switched off
 SAVE_EVERY_S = 15                       # progress/result autosave interval
@@ -313,10 +318,14 @@ class VlessWS:
 
     def set_dest(self, host, port):
         """Destination the proxy server should connect to (sent with the first payload)."""
-        h = host.encode("ascii")
+        try:                                                         # a literal IP is sent as an address ...
+            ip   = ipaddress.ip_address(host)
+            addr = (b"\x01" if ip.version == 4 else b"\x03") + ip.packed
+        except ValueError:                                           # ... anything else as a domain name
+            h    = host.encode("idna")
+            addr = b"\x02" + bytes([len(h)]) + h
         self._hdr = (b"\x00" + self.cfg["uuid_bytes"] + b"\x00"      # version, UUID, no addons
-                     + b"\x01" + struct.pack(">H", port)             # command TCP, port
-                     + b"\x02" + bytes([len(h)]) + h)                # address type domain
+                     + b"\x01" + struct.pack(">H", port) + addr)     # command TCP, port, address
 
     # -- WebSocket framing -----------------------------------------------------
     @staticmethod
@@ -604,39 +613,57 @@ def tunnel_upload(st, target, window, min_mbps):
     """
     Upload through the tunnel in acknowledged POSTs. A chunk only counts once the server
     has answered it, so data still sitting in socket buffers is never counted as speed.
+    A tiny first POST measures the round-trip time; after that the bandwidth is estimated from
+    the TRANSFER part of each request (its time minus that round trip), so a long round trip does
+    not make a fast uplink look slow and the request size can grow quickly. The reported speed
+    starts after the calibration request. A stall says WHERE it happened: data that never left
+    this machine, or data that left and was never answered.
     """
     sock  = st.t.sock
     t0    = now()
-    sent, t_ack, size = 0, t0, UP_MIN
-    # the first 64 KB must be answered within a time that still allows the minimum speed
-    first_wait = max(STALL_SECS, UP_MIN * 8 / (max(min_mbps, 0.05) * 1_000_000) * 1.5 + 1)
+    sent, t_start, t_ack = 0, None, t0           # t_start: when the calibration request was answered
+    rtt, size = None, UP_CAL
+    # the first replies must come in a time that still allows the minimum speed
+    first_wait = max(UP_FIRST_WAIT, UP_FIRST * 8 / (max(min_mbps, 0.05) * 1_000_000) * 1.5 + 1)
     while True:
         if shutdown.is_set(): raise TunnelError("aborted")
         el = now() - t0
         if el >= window: break
-        if el >= PROBE_SECS and sent and mbps(sent, t_ack - t0) < min_mbps / 2:
-            raise TooSlow(mbps(sent, t_ack - t0))
+        if sent and el >= PROBE_SECS and mbps(sent, t_ack - t_start) < min_mbps / 2:
+            raise TooSlow(mbps(sent, t_ack - t_start))
         wait_s = first_wait if not sent else max(1.0, window + STALL_SECS - el)
         sock.settimeout(wait_s)
-        t1 = now()
+        t1  = now()
+        req = _request("POST", target, target["path"],
+                       f"Content-Type: application/octet-stream\r\nContent-Length: {size}\r\n"
+                       f"Connection: keep-alive\r\n") + _UP_BODY[:size]
+        out = 0                                   # bytes of this request the socket has taken so far
         try:
-            st.write(_request("POST", target, target["path"],
-                              f"Content-Type: application/octet-stream\r\nContent-Length: {size}\r\n"
-                              f"Connection: keep-alive\r\n") + _UP_BODY[:size])
+            for i in range(0, len(req), WS_FRAME):
+                st.write(req[i:i + WS_FRAME])
+                out = min(len(req), i + WS_FRAME)
             status, hdrs, rest = _http_head(st)
             if status not in (200, 201, 202, 204):
                 raise _refused(st, status, hdrs, rest)[0]
             _read_body(st, hdrs, rest)
         except socket.timeout:
-            if sent: break                       # keep what was acknowledged so far
-            raise TunnelError(f"stalled: no reply to the first {size // 1024} KB within {wait_s:.0f}s")
-        t_ack  = now()
+            if sent: break                        # keep what was acknowledged so far
+            what = f"{len(req) / 1024:.0f} KB" if len(req) >= 1024 else f"{len(req)} bytes"
+            if out < len(req):
+                raise TunnelError(f"uplink stuck: only {out / 1024:.0f} of {what} went out in {wait_s:.0f}s")
+            raise TunnelError(f"{what} went out but {target['host']} sent no reply in {wait_s:.0f}s")
+        t_done = now()
+        dt     = t_done - t1
+        if t_start is None:                       # the calibration request: its time is mostly pure latency
+            rtt, t_start, t_ack, size = dt, t_done, t_done, UP_FIRST
+            continue
         sent  += size
-        rate   = size / max(t_ack - t1, 1e-3)    # bytes/s of this request
-        size   = int(min(UP_MAX, max(UP_MIN, rate * UP_TARGET)))
+        t_ack  = t_done
+        transfer = max(dt - rtt, dt * 0.1)        # what the data itself needed
+        size   = int(min(UP_MAX, size * 8, max(UP_FIRST, size / transfer * UP_TARGET)))
     if not sent:
         raise TunnelError("no upload acknowledged")
-    return mbps(sent, t_ack - t0)
+    return mbps(sent, t_ack - t_start)
 
 def test_config(ip, cfg, args):
     """
@@ -689,22 +716,21 @@ class TestServers:
     """
     Speed-test URLs in priority order, shared by every test of the run. The server BEHIND the
     tunnel is what talks to them, so a server that refuses us (HTTP error) refuses all edge IPs
-    alike: it is dropped for everybody and the next one is used. Timeouts are blamed on the IP -
-    unless no server has worked yet, then the next server is tried for that IP as well.
+    alike: it is dropped for everybody, wherever it sits in the list. Timeouts are blamed on the
+    IP - unless no server has worked yet, then the next server is tried for that IP as well.
     """
     LABEL = {"down": "download", "up": "upload"}
 
     def __init__(self, down, up):
         self.lock    = threading.Lock()
-        self.cands   = {"down": list(down), "up": list(up)}
-        self.pos     = {"down": 0, "up": 0}
+        self.alive   = {"down": list(down), "up": list(up)}   # priority order, dropped ones removed
         self.shown   = {"down": set(), "up": set()}
         self.proven  = {"down": False, "up": False}
-        self.skipped = {"down": [], "up": []}               # "host: why" lines
+        self.skipped = {"down": [], "up": []}                 # "host: why" lines
 
     def remaining(self, kind):
         with self.lock:
-            return self.cands[kind][self.pos[kind]:]
+            return list(self.alive[kind])
 
     def is_proven(self, kind):
         return self.proven[kind]
@@ -724,30 +750,30 @@ class TestServers:
         with print_lock:
             print(f"  {CG}▸ {self.LABEL[kind]} test server:{R} {CW}{url}{R}")
 
-    def _skip(self, kind, target, why):                      # caller holds self.lock
-        self.skipped[kind].append(f"{target['host']}: {why}")
-        return f"    {CGR}skipped {target['host']}: {why}{R}"
+    def _index(self, kind, target):                           # caller holds self.lock
+        return next((j for j, t in enumerate(self.alive[kind]) if t is target), None)
 
     def drop(self, kind, target, why):
         with self.lock:
-            lst = self.cands[kind]
-            if self.pos[kind] >= len(lst) or lst[self.pos[kind]] is not target:
-                return                                       # someone else already dropped it
-            self.pos[kind] += 1
-            line = self._skip(kind, target, why)
+            i = self._index(kind, target)
+            if i is None:
+                return                                        # someone else already dropped it
+            del self.alive[kind][i]
+            self.skipped[kind].append(f"{target['host']}: {why}")
         with print_lock:
-            print(line)
+            print(f"    {CGR}skipped {target['host']}: {why}{R}")
 
     def prove(self, kind, target):
-        """`target` really carried data: keep it, and drop earlier servers that only timed out."""
+        """`target` really carried data: keep it, and drop the servers ranked before it that only timed out."""
         lines = []
         with self.lock:
             self.proven[kind] = True
-            lst = self.cands[kind]
-            i = next((j for j, t in enumerate(lst) if t is target), None)
-            while i is not None and self.pos[kind] < i:
-                lines.append(self._skip(kind, lst[self.pos[kind]], f"no reply while {target['host']} worked"))
-                self.pos[kind] += 1
+            i = self._index(kind, target)
+            for gone in (self.alive[kind][:i] if i else []):
+                self.skipped[kind].append(f"{gone['host']}: no reply while {target['host']} worked")
+                lines.append(f"    {CGR}skipped {gone['host']}: no reply while {target['host']} worked{R}")
+            if i:
+                del self.alive[kind][:i]
         with print_lock:
             for l in lines: print(l)
 
@@ -758,13 +784,13 @@ def with_failover(kind, servers, attempt):
     only while no server has worked yet (afterwards it is the IP's fault). NoServer when every
     server refused.
     """
-    last, all_refused = None, True
+    notes = []                                               # what each non-refusing server did for THIS IP
     for target in servers.remaining(kind):
         servers.announce(kind, target)
         try:
             value = attempt(target)
         except Refused as e:
-            servers.drop(kind, target, str(e)); last = e
+            servers.drop(kind, target, str(e))
             continue
         except TooSlow:
             servers.prove(kind, target)                      # it took our data, the IP is just slow
@@ -772,24 +798,28 @@ def with_failover(kind, servers, attempt):
         except (TunnelError, OSError) as e:                  # timeout / stall / reset
             if shutdown.is_set() or str(e) == "aborted" or servers.is_proven(kind):
                 raise
-            all_refused, last = False, e
+            notes.append(f"{target['host']}: {_note(e)[:80]}")
             continue
         servers.prove(kind, target)
         return value
-    if all_refused:
-        raise NoServer(kind)
-    raise last
+    if not notes:
+        raise NoServer(kind)                                 # every server refused
+    raise TunnelError(" | ".join(notes))
 
-def disable_upload(args, why):
+def disable_upload(args, why, details=()):
     """Judge IPs by download only from now on (once, loudly)."""
     with upload_lock:
         if args.no_upload: return False
         args.no_upload = True
-    warn_notes.append(f"{CY}{B}⚠ Upload tests were switched OFF during this run:{R} {CY}{why}{R}")
+    lines = [f"{CY}{B}⚠ Upload tests switched OFF:{R} {CY}{why}{R}"]
+    lines += [f"    {CGR}what the IPs said:{R} {CY}{d}{R}" for d in details]
+    lines += [f"    {CW}IPs are judged by download speed only from now on (their upload_mbps stays empty).{R}",
+              f"    {CW}\"went out but no reply\" = the upload servers do not answer your VPS; \"uplink stuck\" = the data did not{R}",
+              f"    {CW}leave your PC. To test against your own VPS instead, run speedtest_server.py on it and pass --down-url /{R}",
+              f"    {CW}--up-url (README: \"Test against your own server\").{R}"]
+    warn_notes.append("\n".join(lines))
     with print_lock:
-        print(f"\n  {CY}{B}⚠ Upload tests switched OFF:{R} {CY}{why}{R}\n"
-              f"    {CW}IPs are judged by download speed only from now on (their upload_mbps stays empty).\n"
-              f"    This usually means your own uplink or the test servers are the limit, not the IPs.{R}\n")
+        print("\n" + "\n".join("  " + l for l in lines) + "\n")
     return True
 
 def measure_ip(ip, cfg, args):
@@ -1298,8 +1328,7 @@ def run_speed_test_phase(candidates, args, cfg):
     def after_upload(entry, res):
         """Upload safeguards: give up on upload when it never works, hint when it rejects everything."""
         v, reason = res["verdict"], res.get("reason", "")
-        stalled = (v == "fail" and reason.startswith("upload:")
-                   and any(k in reason for k in ("stalled", "timeout", "no reply", "no data")))
+        stalled = v == "fail" and reason.startswith("upload:")
         revert = None
         with upload_lock:
             s = upload_state
@@ -1313,8 +1342,12 @@ def run_speed_test_phase(candidates, args, cfg):
             if hint: s["hinted"] = True
             if not s["worked"] and len(s["streak"]) >= UPLOAD_GIVEUP and not args.no_upload:
                 revert = list(s["streak"]); s["streak"].clear()
-        if revert and disable_upload(args, f"no reply to the upload test on {len(revert)} IPs in a row, "
-                                           f"on every upload server, and it never worked in this run"):
+        said = []
+        for e in revert or ():
+            r = str(e.get("reason", "")).replace("upload: ", "", 1)
+            if r and r not in said: said.append(r)
+        if revert and disable_upload(args, f"the upload test failed on {len(revert)} IPs in a row, on every upload server, "
+                                           f"and it never worked in this run", said[:3]):
             with alive_lock:                            # those IPs passed the download test: count them as passed
                 for e in revert:
                     e.update(verdict="pass", reason="", upload_note="not measured: upload stalled everywhere",
@@ -1334,7 +1367,7 @@ def run_speed_test_phase(candidates, args, cfg):
     if len(candidates) > PRESCREEN_MIN:
         print(f"\n  {CM}{B}▸ Quick screen of {len(candidates)} IPs, {PRESCREEN_THREADS} at a time: "
               f"can their tunnel carry data at all?{R}\n")
-        ok, ok_lock = [], threading.Lock()
+        ok, bad, failed, ok_lock = [], [], [], threading.Lock()
 
         def screen(entry):
             if stopped(): return
@@ -1347,7 +1380,9 @@ def run_speed_test_phase(candidates, args, cfg):
             if reason is None:
                 with ok_lock: ok.append(entry)
             else:
-                record(entry, {"verdict": "fail", "reason": "download: " + reason})
+                with ok_lock: bad.append(reason)
+                if record(entry, {"verdict": "fail", "reason": "download: " + reason}):
+                    with ok_lock: failed.append(entry)
 
         _run_pool(screen, candidates, PRESCREEN_THREADS)
         survivors = sorted(ok, key=delay)
@@ -1355,6 +1390,24 @@ def run_speed_test_phase(candidates, args, cfg):
             return
         print(f"\n  {CG}▸ {len(survivors)} of {len(candidates)} IPs can carry data{R}")
         if not survivors:
+            common = max(set(bad), key=bad.count) if bad else ""
+            if len(bad) >= 5 and bad.count(common) >= 0.8 * len(bad):
+                # nothing worked and nearly everything failed the SAME way: the test server / your VPS, not the IPs
+                lines = [f"{CY}{B}⚠ {bad.count(common)} of {len(bad)} IPs failed the same way:{R} {CY}{common}{R}",
+                         f"{CW}That points at the TEST SERVER (or your VPS), not at the IPs - so these IPs were NOT judged and the run stops.{R}",
+                         f"{CW}Is the server in --down-url reachable from your VPS? Is speedtest_server.py running there, and does your{R}",
+                         f"{CW}Xray config block private addresses (then bind it to 0.0.0.0 and use the VPS's public IP)?{R}"]
+                with refusal_lock:
+                    host_refuses.set()
+                    stop_notes.extend(lines)
+                with alive_lock:                            # un-judge them: it was not their fault
+                    for e in failed:
+                        for k in ("verdict", "reason", "download_mbps", "upload_mbps", "dl_full", "ul_full", "judged"):
+                            e.pop(k, None)
+                with stats["lock"]:
+                    stats["failed"] -= len(failed); stats["untested"] += len(failed)
+                print("\n" + "\n".join("  " + l for l in lines) + "\n")
+                return
             print()
             return
 
