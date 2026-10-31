@@ -212,17 +212,19 @@ Cloudflare IP → your VPS*.
    `nohup python3 speedtest_server.py &`, or a systemd service):
 
    ```bash
-   python3 speedtest_server.py            # all addresses, port 8080
+   python3 speedtest_server.py
    ```
 
-   It prints a line when it starts and one when the first connections arrive — if nothing arrives later, the
-   tunnel cannot reach it (see below). Use a free port above 1024: port 80 needs root and is often taken by nginx/Caddy.
+   It does **not** touch your panel or Xray — you never have to stop x-ui; it is a separate little program that only
+   needs a free port. It tries 8080 and, if something else already holds it (x-ui, another inbound, ...), picks a free
+   port by itself and says so. It then prints the exact options to use. It also logs the first connections — if none
+   arrive once the scanner runs, the tunnel cannot reach it (see below).
 
-2. On your PC, point the speed test at it, with **your VPS's public IP** (`VPS_IP`):
+2. On your PC, point the speed test at it, with **your VPS's public IP** and the port it printed:
 
    ```bash
    python3 cf_ping.py subnets.txt -c "vless://..." --speed-test \
-       --down-url "http://VPS_IP:8080/down?bytes={bytes}" --up-url "http://VPS_IP:8080/up"
+       --down-url "http://VPS_IP:PORT/down?bytes={bytes}" --up-url "http://VPS_IP:PORT/up"
    ```
 
 **Why the public IP and not `127.0.0.1`:** the VPS opens that connection, and many Xray servers (3x-ui by default)

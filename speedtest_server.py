@@ -7,35 +7,39 @@ third-party one (speed.cloudflare.com, Hetzner, ... may refuse or ignore request
 The only thing measured is then "your PC -> Cloudflare IP -> your VPS", which is exactly the part
 that differs between Cloudflare IPs.
 
-  python3 speedtest_server.py                  # all addresses, port 8080 (no root needed)
+  python3 speedtest_server.py
 
-Then, on your PC (use YOUR VPS's public IP: the scanner prints it if it cannot reach the server):
-  python3 cf_ping.py subnets.txt -c "vless://..." --speed-test \\
-      --down-url "http://VPS_IP:8080/down?bytes={bytes}" --up-url "http://VPS_IP:8080/up"
+It needs no root and does NOT touch your panel / Xray: it is a separate little program that only
+needs a free port. It tries 8080 and, if something (x-ui, ...) already uses it, picks a free port
+itself - then prints the exact scanner options to use. Leave it running while the scanner runs.
 
-Why the public IP and not 127.0.0.1: the VPS opens the connection, and many Xray servers (3x-ui by
-default) BLOCK private/loopback destinations, so 127.0.0.1 gets "closed the connection without
-answering". The public IP is not private. It is safe to listen on all addresses because the server
-answers ONLY connections made from the VPS itself (that is where Xray connects from); everybody
-else gets "403 local clients only". Use --allow-any if Xray runs somewhere else (e.g. in Docker
-with its own network) and the connections seem to come from another address.
+Use your VPS's PUBLIC IP in the scanner's URLs, not 127.0.0.1: the VPS opens the connection, and
+many Xray servers (3x-ui by default) BLOCK private/loopback destinations, so 127.0.0.1 gets "closed
+the connection without answering". Listening on all addresses is safe because the server answers
+ONLY connections made from the VPS itself (that is where Xray connects from); everybody else gets
+"403 local clients only". Use --allow-any if Xray runs somewhere else (e.g. in Docker with its own
+network) and the connections seem to come from another address.
 
 Endpoints:  GET /down?bytes=N  -> N bytes (default 100 MB, at most 4 GB)
             POST /up           -> reads the body, answers "ok"
 Standard library only, Python 3.8+, Windows and Linux.
 """
 import argparse
+import errno
 import ipaddress
 import os
+import re
 import socket
+import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-MAX_BYTES = 4 * 1024 ** 3
-CHUNK     = os.urandom(65536)
-OPTS      = {"allow_any": False, "quiet": False, "connections": 0}
+DEFAULT_PORT = 8080
+MAX_BYTES    = 4 * 1024 ** 3
+CHUNK        = os.urandom(65536)
+OPTS         = {"allow_any": False, "quiet": False, "connections": 0}
 
 
 def log(msg):
@@ -132,27 +136,78 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
 
 
+def make_server(bind, port):
+    Server.address_family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+    return Server((bind, port), Handler)
+
+
+def port_owner(port):
+    """Who listens on this port? (best effort: Linux `ss`; needs root to see other users' programs)"""
+    try:
+        out = subprocess.run(["ss", "-H", "-ltnp", f"sport = :{port}"], capture_output=True, text=True,
+                             timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', out)
+    return f"{m.group(1)} (pid {m.group(2)})" if m else None
+
+
+def free_port(bind):
+    """A port that is free right now (the OS picks it)."""
+    with socket.socket(socket.AF_INET6 if ":" in bind else socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((bind, 0))
+        return s.getsockname()[1]
+
+
+def local_ip():
+    """This machine's main IPv4 address (a UDP 'connect' sends nothing; it only picks the route)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Speed-test server for CF-SCAN (run it on your VPS)")
     ap.add_argument("--bind", default="0.0.0.0", help="address to listen on (default: 0.0.0.0 = all; '::' for IPv6)")
-    ap.add_argument("--port", type=int, default=8080, help="port (default: 8080; below 1024 needs root)")
+    ap.add_argument("--port", type=int, default=None,
+                    help=f"port (default: {DEFAULT_PORT}, or a free one if that is taken; below 1024 needs root)")
     ap.add_argument("--allow-any", action="store_true", help="also answer connections that do not come from this machine")
     ap.add_argument("--quiet", action="store_true", help="no log lines")
     args = ap.parse_args()
     OPTS["allow_any"], OPTS["quiet"] = args.allow_any, args.quiet
-    if ":" in args.bind:
-        Server.address_family = socket.AF_INET6
+
+    explicit = args.port is not None
+    port     = args.port if explicit else DEFAULT_PORT
     try:
-        srv = Server((args.bind, args.port), Handler)
+        srv = make_server(args.bind, port)
     except PermissionError:
-        sys.exit(f"cannot listen on port {args.port}: ports below 1024 need root. Use a higher one, e.g. --port 8080")
+        sys.exit(f"cannot listen on port {port}: ports below 1024 need root. Leave --port out (a free port is chosen).")
     except OSError as e:
-        sys.exit(f"cannot listen on {args.bind}:{args.port}: {e}\n"
-                 f"Is another program using that port (nginx, Caddy, the panel)? Try --port 8080")
+        if e.errno not in (errno.EADDRINUSE, 10048):                 # 10048 = WSAEADDRINUSE on Windows
+            sys.exit(f"cannot listen on {args.bind}:{port}: {e}")
+        owner = port_owner(port)
+        used  = f"port {port} is already used by {owner}" if owner else f"port {port} is already in use"
+        if explicit:
+            sys.exit(f"{used}.\nNo need to stop it: any other free port works - e.g. --port {free_port(args.bind)} "
+                     f"(free right now) - or leave --port out and a free one is chosen for you.")
+        print(f"{used} (your panel / Xray?) - leaving it alone and choosing a free port instead", flush=True)
+        srv = make_server(args.bind, 0)
+    port = srv.server_address[1]
+
     who = "any client" if args.allow_any else "connections made from this machine only"
-    print(f"speed-test server listening on {args.bind}:{args.port} - answers {who}", flush=True)
-    print(f'scanner: --down-url "http://VPS_IP:{args.port}/down?bytes={{bytes}}" --up-url "http://VPS_IP:{args.port}/up"'
-          f"   (VPS_IP = this server's public IP)", flush=True)
+    ip  = local_ip()
+    shown = ip or "VPS_IP"
+    print(f"speed-test server listening on {args.bind}:{port} - answers {who}", flush=True)
+    print(f'scanner:  --down-url "http://{shown}:{port}/down?bytes={{bytes}}" --up-url "http://{shown}:{port}/up"', flush=True)
+    if not ip:
+        print("          (replace VPS_IP with this server's public IP)", flush=True)
+    elif ipaddress.ip_address(ip).is_private:
+        print(f"          ({ip} is a private address - this machine is behind NAT: use its PUBLIC IP instead)", flush=True)
+    else:
+        print("          (if that IP is not your VPS's public IP, use the public one)", flush=True)
     print("waiting for the scanner... (Ctrl+C to stop)", flush=True)
     try:
         srv.serve_forever()

@@ -1317,10 +1317,11 @@ def diagnose_test_server(ip, cfg, args, target):
         lines.append(f'  --down-url "http://{shown}:{port}/down?bytes={{bytes}}" --up-url "http://{shown}:{port}/up"')
     else:
         lines.append(f"{shown}:{port} does not answer either ({text.replace(f'{shown}:{port} ', '', 1)}) - the server is not listening there.")
-        lines.append("Start it so it listens on all addresses (the default; a server bound to 127.0.0.1 only accepts connections to")
-        lines.append("127.0.0.1) and on a free port - port 80 needs root and is often taken by nginx/Caddy:")
-        lines.append("  python3 speedtest_server.py --port 8080")
-        lines.append(f'  --down-url "http://{shown}:8080/down?bytes={{bytes}}" --up-url "http://{shown}:8080/up"')
+        lines.append("Start the server on the VPS. It listens on all addresses (one bound to 127.0.0.1 only accepts connections to")
+        lines.append("127.0.0.1), takes port 8080 or picks a free port by itself if x-ui / something else uses it (no need to stop")
+        lines.append("those), and prints the exact options:")
+        lines.append("  python3 speedtest_server.py")
+        lines.append(f"Use {exit_ip} as the IP in both URLs and the port it prints.")
     return lines
 
 def fmt_speed(v):
