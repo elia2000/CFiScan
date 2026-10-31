@@ -40,8 +40,8 @@ Speed-test options (need -c):
   --min-download  Reject IPs below this download Mbps         (default: 2)
   --min-upload    Reject IPs below this upload Mbps           (default: 1)
   --no-upload     Skip the upload test
-  --speed-threads Parallel speed tests. Keep 1 for honest numbers - parallel
-                   tests share your bandwidth                 (default: 1)
+  --speed-threads Ignored. Speed tests ALWAYS run one at a time: tests running
+                   together share your bandwidth and every number reads too low
   --want N        Stop everything as soon as N IPs passed (default: 0 = scan all)
   --sort          download | upload | delay                   (default: download)
   --loss-count    ICMP pings per IP for packet loss, 0 = off  (default: 0)
@@ -152,6 +152,7 @@ want_reached = threading.Event()      # --want N satisfied
 host_refuses = threading.Event()      # no download test server answers
 refusal_lock = threading.Lock()       # guards host_refuses / stop_notes
 stop_notes   = []                     # why the run stopped early; printed again in the final summary
+warn_notes   = []                     # warnings that must still be visible in the final summary
 upload_lock  = threading.Lock()
 upload_state = {"streak": [], "worked": False, "rej": 0, "hinted": False}
 done_ips_set = set()
@@ -769,7 +770,7 @@ def with_failover(kind, servers, attempt):
             servers.prove(kind, target)                      # it took our data, the IP is just slow
             raise
         except (TunnelError, OSError) as e:                  # timeout / stall / reset
-            if shutdown.is_set() or servers.is_proven(kind):
+            if shutdown.is_set() or str(e) == "aborted" or servers.is_proven(kind):
                 raise
             all_refused, last = False, e
             continue
@@ -784,6 +785,7 @@ def disable_upload(args, why):
     with upload_lock:
         if args.no_upload: return False
         args.no_upload = True
+    warn_notes.append(f"{CY}{B}⚠ Upload tests were switched OFF during this run:{R} {CY}{why}{R}")
     with print_lock:
         print(f"\n  {CY}{B}⚠ Upload tests switched OFF:{R} {CY}{why}{R}\n"
               f"    {CW}IPs are judged by download speed only from now on (their upload_mbps stays empty).\n"
@@ -802,7 +804,7 @@ def measure_ip(ip, cfg, args):
     try:
         dl = with_failover("down", sv, lambda t: run_in_tunnel(ip, cfg, args, t, tunnel_download,
                                                                args.speed_time, args.min_download))
-        out["download_mbps"] = round(dl, 2)
+        out["download_mbps"], out["dl_full"] = round(dl, 2), True       # a full-window measurement
     except NoServer:
         return {"verdict": "unjudged", "reason": "no download test server answers"}
     except TooSlow as e:
@@ -817,7 +819,7 @@ def measure_ip(ip, cfg, args):
     try:
         ul = with_failover("up", sv, lambda t: run_in_tunnel(ip, cfg, args, t, tunnel_upload,
                                                              args.speed_time, args.min_upload))
-        out["upload_mbps"] = round(ul, 2)
+        out["upload_mbps"], out["ul_full"] = round(ul, 2), True
     except NoServer:
         disable_upload(args, "every upload test server refused us")
         return out
@@ -940,7 +942,7 @@ def parse_args():
     ap.add_argument("--min-download",  type=float, default=2.0,    help="Reject IPs below this download Mbps (default:2)")
     ap.add_argument("--min-upload",    type=float, default=1.0,    help="Reject IPs below this upload Mbps (default:1)")
     ap.add_argument("--no-upload",     action="store_true",        help="Skip the upload test")
-    ap.add_argument("--speed-threads", type=int,   default=1,      help="Parallel speed tests; >1 is faster but they share your bandwidth (default:1)")
+    ap.add_argument("--speed-threads", type=int,   default=1,      help="Ignored: speed tests always run one at a time, because tests running together share your bandwidth and every number would read too low")
     ap.add_argument("--want",          type=int,   default=0,      help="Stop once N good IPs were found (default:0 = scan all)")
     ap.add_argument("--sort",          choices=["download", "upload", "delay"], default="download", help="Result order (default:download)")
     ap.add_argument("--loss-count",    type=int,   default=0,      help="ICMP pings per IP for packet loss, 0 = off (default:0)")
@@ -1010,6 +1012,49 @@ def load_results(path):
         return [e for e in items if isinstance(e, dict) and e.get("ip")]
     except Exception:
         return []
+
+def rejudge(e, args):
+    """
+    Apply TODAY's speed settings to a verdict from an earlier run (the result file survives between
+    runs, the options do not). A complete measurement is judged again from its stored numbers; an
+    aborted or failed one stays valid only if it would be rejected under the new limits as well.
+    Returns the standing verdict, or None when the IP has to be measured again (e is reset).
+    """
+    v = e.get("verdict")
+    if v not in ("pass", "slow", "fail"):
+        return v
+    dl, ul  = e.get("download_mbps"), e.get("upload_mbps")
+    reason  = str(e.get("reason", ""))
+    old     = e.get("judged") or {}
+    old_dl  = old.get("dl", 2.0)                    # verdicts without a stamp: the defaults of that time
+    old_ul  = old.get("ul")
+    full_dl = dl is not None and (bool(e.get("dl_full")) or v == "pass")
+    full_ul = ul is not None and (bool(e.get("ul_full")) or v == "pass")
+    new     = None
+    if full_dl:
+        if dl < args.min_download:
+            new = ("slow", f"download {dl} Mbps < {args.min_download:g}")
+        elif args.no_upload:
+            new = ("pass", "")
+        elif full_ul:
+            new = ("pass", "") if ul >= args.min_upload else ("slow", f"upload {ul} Mbps < {args.min_upload:g}")
+        elif v == "slow" and reason.startswith("upload") and args.min_upload >= (old_ul or 1.0):
+            new = ("slow", reason)                  # the upload was cut off as too slow, and still would be
+        elif v == "fail" and reason.startswith("upload:"):
+            new = ("fail", reason)                  # the upload stalled: not a matter of limits
+    elif v == "slow" and reason.startswith("download") and args.min_download >= old_dl:
+        new = ("slow", reason)
+    elif v == "fail" and reason.startswith("download") and "HTTP" not in reason:
+        new = ("fail", reason)                      # stall / timeout (HTTP errors were the test server's doing)
+    if new is None:
+        for k in ("verdict", "reason", "download_mbps", "upload_mbps", "dl_full", "ul_full", "judged", "upload_note"):
+            e.pop(k, None)
+        return None
+    e["verdict"], e["reason"] = new
+    e["judged"] = {"dl": args.min_download, "ul": None if args.no_upload else args.min_upload}
+    if new[0] == "pass" and not full_ul:
+        e.pop("upload_mbps", None)
+    return new[0]
 
 def _atomic_write(path, data):
     tmp = path + ".tmp"
@@ -1230,8 +1275,9 @@ def run_speed_test_phase(candidates, args, cfg):
         v = res["verdict"]
         if v == "unjudged":
             no_download_server(); return False
-        if shutdown.is_set() and v == "fail":
-            return False                                # cut short by Ctrl+C: not the IP's fault, stays untested
+        if v == "fail" and (shutdown.is_set() or res.get("reason", "").endswith("aborted")):
+            return False                                # cut short (Ctrl+C / target reached): not the IP's fault, stays untested
+        res = dict(res, judged={"dl": args.min_download, "ul": None if args.no_upload else args.min_upload})
         with alive_lock:
             entry.update(res)
         with stats["lock"]:
@@ -1271,7 +1317,8 @@ def run_speed_test_phase(candidates, args, cfg):
                                            f"on every upload server, and it never worked in this run"):
             with alive_lock:                            # those IPs passed the download test: count them as passed
                 for e in revert:
-                    e.update(verdict="pass", reason="", upload_note="not measured: upload stalled everywhere")
+                    e.update(verdict="pass", reason="", upload_note="not measured: upload stalled everywhere",
+                             judged={"dl": args.min_download, "ul": None})
                     e.pop("upload_mbps", None)
             with stats["lock"]:
                 stats["failed"] -= len(revert); stats["passed"] += len(revert)
@@ -1316,7 +1363,7 @@ def run_speed_test_phase(candidates, args, cfg):
     print(f"\n  {CM}{B}▸ Real speed test of {len(survivors)} IPs through your VLESS tunnel "
           f"(download{ul_txt}, {args.speed_time:g}s each, min {args.min_download:g}"
           f"{'' if args.no_upload else '/' + format(args.min_upload, 'g')} Mbps, "
-          f"{args.speed_threads} at a time)…{R}\n")
+          f"one timed test at a time)…{R}\n")
 
     def job(entry):
         if stopped(): return
@@ -1329,7 +1376,7 @@ def run_speed_test_phase(candidates, args, cfg):
         if record(entry, res):
             after_upload(entry, res)
 
-    _run_pool(job, survivors, args.speed_threads)
+    _run_pool(job, survivors, 1)               # strictly one at a time: tests must not share your bandwidth
 
     if host_refuses.is_set():
         return                                          # the explanation was printed (and is repeated at the end)
@@ -1501,6 +1548,13 @@ def run(args):
                   f"use a URL of a large file that really exists.{R}")
             sys.exit(1)
 
+    if args.speed_test and args.speed_threads != 1:
+        note = (f"{CY}ℹ --speed-threads {args.speed_threads} is ignored: speed tests run one IP at a time, because tests "
+                f"running together share your bandwidth and every number would read too low "
+                f"(fast IPs looked slow, so almost nothing passed --min-download).{R}")
+        warn_notes.append(note)
+        print(f"  {note}")
+
     if args.tls13_only and not args.sni:
         print(f"  {CR}  --tls13-only requires -s/--sni{R}"); sys.exit(1)
     if args.speed_test and (not cfg or args.ping_only):
@@ -1522,6 +1576,23 @@ def run(args):
     random.shuffle(remaining_ips)
     if resumed:
         old = load_results(args.output)
+        if args.speed_test:
+            kept = redone = again = 0
+            for e in old:
+                if e.get("method") != "ws" or e.get("verdict") not in ("pass", "slow", "fail"):
+                    continue
+                before = (e["verdict"], e.get("reason"))
+                after  = rejudge(e, args)
+                if after is None:
+                    again += 1
+                elif (after, e.get("reason")) != before:
+                    redone += 1
+                else:
+                    kept += 1
+            if kept + redone + again:
+                lim = f"{args.min_download:g}" + ("" if args.no_upload else f"/{args.min_upload:g}")
+                print(f"  {CY}▸ Earlier speed verdicts vs. today's limits ({lim} Mbps): {kept} still valid, "
+                      f"{redone} re-judged from their stored numbers, {again} will be measured again{R}")
         with alive_lock: alive_ips.extend(old)
         for e in old:
             m = e.get("method")
@@ -1662,10 +1733,19 @@ def run(args):
     print(f"  {CY}{'✔ TLS 1.2':<26}{R}{CY}{s['tls12']:>10,}{R}")
     print(f"  {CC}{'✔ TCP/Ping':<26}{R}{CC}{s['tcp_only']:>10,}{R}")
     print(f"  {CR}{'✘ Dead':<26}{R}{CR}{s['dead']:>10,}{R}")
+    n_up = 0
     if args.speed_test:
+        with alive_lock:
+            n_up = sum(1 for e in alive_ips if e.get("verdict") == "pass" and e.get("upload_mbps") is not None)
         print(f"  {CG}{'⚡ Passed speed test':<26}{R}{CG}{B}{s['passed']:>10,}{R}")
+        print(f"  {CG}{'   with upload measured':<26}{R}{CW}{n_up:>10,}{R}")
         print(f"  {CR}{'Rejected (slow/failed)':<26}{R}{CR}{s['slow'] + s['failed']:>10,}{R}")
         print(f"  {CM}{'Not speed-tested yet':<26}{R}{CW}{s['untested']:>10,}{R}")
+        for l in warn_notes:
+            print(f"\n  {l}")
+        if args.sort == "upload" and s["passed"] > 0 and n_up == 0:
+            print(f"\n  {CY}{B}⚠ --sort upload, but none of the passed IPs has an upload number{R}"
+                  f"{CY} - the order is by download then. {'Upload is off (--no-upload).' if args.no_upload else 'See the upload notes above.'}{R}")
 
     with alive_lock:
         top = sorted((e for e in alive_ips if e.get("verdict") == "pass"),
@@ -1676,6 +1756,20 @@ def run(args):
             ul = "" if e.get("upload_mbps") is None else f"  ↑{fmt_speed(e['upload_mbps'])}"
             print(f"  {CG}{e['ip']:<18}{R} {CG}↓{fmt_speed(e['download_mbps'])}{R}{CG}{ul}{R}"
                   f"  {CGR}{e.get('tunnel_ms') or '?'}ms{R}")
+
+    if args.speed_test and s["passed"] == 0:
+        with alive_lock:
+            tried = sorted((dict(e) for e in alive_ips if e.get("verdict") in ("slow", "fail") and e.get("download_mbps")),
+                           key=lambda e: -(e["download_mbps"] or 0))[:5]
+        if tried:
+            lim = f"download {args.min_download:g}" + ("" if args.no_upload else f", upload {args.min_upload:g}")
+            print(f"\n  {CY}{B}No IP reached your limits (min {lim} Mbps). The closest ones:{R}")
+            for e in tried:
+                ul = "" if e.get("upload_mbps") is None else f"  ↑{fmt_speed(e['upload_mbps'])}"
+                early = "" if e.get("dl_full") else "  (stopped early)"
+                print(f"  {CW}{e['ip']:<18}{R} ↓{fmt_speed(e['download_mbps'])}{ul}{early}  {CGR}{e.get('reason', '')}{R}")
+            print(f"  {CW}Lower --min-download / --min-upload, or raise --speed-time (the speed is the average over that "
+                  f"time, slow start included).{R}")
 
     print(f"\n  {CG}Results → {B}{args.output}{R}")
     print(f"  {CC}Resume  → {B}{args.resume}{R}")

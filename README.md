@@ -97,7 +97,7 @@ The script prints **Mbps** (megabits/s) and, next to it, **MB/s** (megabytes/s, 
 | `--min-download` | 2 | Reject IPs slower than this download speed (Mbps) |
 | `--min-upload` | 1 | Reject IPs slower than this upload speed (Mbps) |
 | `--no-upload` | off | Skip the upload test |
-| `--speed-threads` | 1 | Parallel speed tests. Keep **1** for honest numbers — parallel tests share your bandwidth |
+| `--speed-threads` | – | **Ignored.** Speed tests always run one IP at a time: tests running together share your bandwidth, so every number reads too low (with `--speed-threads 10` fast IPs looked slow and almost nothing passed `--min-download`). The quick screen is the only parallel step |
 | `--want N` | 0 (off) | Stop everything once N IPs passed (N verified IPs without `--speed-test`) |
 | `--sort` | `download` | Result order: `download`, `upload` or `delay` |
 | `--loss-count` | 0 (off) | ICMP pings per IP for packet loss (needs `ping`; many networks block ICMP) |
@@ -106,7 +106,8 @@ The script prints **Mbps** (megabits/s) and, next to it, **MB/s** (megabytes/s, 
 Tips:
 
 * **Save time:** `--want 10` (or any N) — you rarely need more than a handful of good IPs.
-* Raise `--min-download` / `--min-upload` (for example `--min-download 8`) to reject mediocre IPs even faster.
+* Raise `--min-download` / `--min-upload` (for example `--min-download 8`) to reject mediocre IPs even faster — but keep them realistic: **upload is only tested for IPs that already passed the download test**, so a `--min-download` above what your path can do means no IP ever reaches the upload test. If nothing passes, the summary lists the closest IPs with their numbers.
+* The speed is the average over `--speed-time` seconds, TCP slow start included (like most download tests). Limits close to your line speed need a longer window, e.g. `--speed-time 10`.
 * Slow link or far-away server? Raise `-w` (e.g. `-w 5`) and `--speed-time` (e.g. `8`).
 * Close other downloads while testing; they eat the bandwidth that is being measured.
 
@@ -142,6 +143,8 @@ automatically the next time you resume.
 again to continue. Both files belong to **one config + mode**: change the config (UUID, host, path, SNI, port,
 `--no-verify`, `--verify-url`) and the old progress is ignored and the scan starts fresh. Use `-o` / `-r` to keep
 several scans side by side.
+
+**Changing the speed settings between runs is safe.** Every verdict is stamped with the limits it was judged against. When you run again with other `--min-download` / `--min-upload` / `--no-upload`, the script checks the earlier verdicts against the new limits first and prints e.g. `2 still valid, 2 re-judged from their stored numbers, 7 will be measured again`: complete measurements are simply re-judged, cut-off ones stay rejected if they would be rejected anyway, and an IP is measured again when the new settings need something that was never measured (for example upload after a `--no-upload` run). Without this, old download-only results would sit in the list next to the new ones and `--sort upload` would have nothing to sort.
 
 ---
 
