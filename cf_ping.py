@@ -478,14 +478,19 @@ def open_stream(tun, target):
     if not target["tls"]:
         return PlainStream(tun)
     st = TunnelTLS(tun, target["host"])
-    st.handshake()
+    try:
+        st.handshake()
+    except ssl.SSLEOFError:
+        raise TunnelError(f"{target['host']}:{target['port']} closed the connection without answering")
     return st
 
-def _http_head(st):
+def _http_head(st, target=None):
     buf = b""
     while b"\r\n\r\n" not in buf:
         chunk = st.read()
         if not chunk:
+            if not buf and target:      # the tunnel closed without a single byte: the VPS could not (or would not) reach it
+                raise TunnelError(f"{target['host']}:{target['port']} closed the connection without answering")
             raise TunnelError("closed before HTTP reply")
         buf += chunk
         if len(buf) > 65536:
@@ -544,7 +549,7 @@ def verify_tunnel(tun, target):
     """Real-delay check (like V2rayN's): a request to `target` through the tunnel must be answered."""
     st = open_stream(tun, target)
     st.write(_request("GET", target, target["path"], "Connection: close\r\n"))
-    status, hdrs, rest = _http_head(st)
+    status, hdrs, rest = _http_head(st, target)
     if status not in (200, 204):
         raise _refused(st, status, hdrs, rest)[0]
 
@@ -567,7 +572,7 @@ def tunnel_download(st, target, window, min_mbps, until_bytes=None):
             try:
                 st.write(_request("GET", target, target["path"].replace("{bytes}", str(size)),
                                   "Connection: keep-alive\r\n"))
-                status, hdrs, rest = _http_head(st)
+                status, hdrs, rest = _http_head(st, target)
             except (TunnelError, OSError):
                 if got: break                  # server closed after the first request: use what we have
                 raise
@@ -642,7 +647,7 @@ def tunnel_upload(st, target, window, min_mbps):
             for i in range(0, len(req), WS_FRAME):
                 st.write(req[i:i + WS_FRAME])
                 out = min(len(req), i + WS_FRAME)
-            status, hdrs, rest = _http_head(st)
+            status, hdrs, rest = _http_head(st, target)
             if status not in (200, 201, 202, 204):
                 raise _refused(st, status, hdrs, rest)[0]
             _read_body(st, hdrs, rest)
@@ -798,7 +803,8 @@ def with_failover(kind, servers, attempt):
         except (TunnelError, OSError) as e:                  # timeout / stall / reset
             if shutdown.is_set() or str(e) == "aborted" or servers.is_proven(kind):
                 raise
-            notes.append(f"{target['host']}: {_note(e)[:80]}")
+            why = _note(e)[:80]
+            notes.append(why if why.startswith(target["host"]) else f"{target['host']}: {why}")
             continue
         servers.prove(kind, target)
         return value
@@ -1261,6 +1267,62 @@ def result_processor(result_q, args, cfg, scan_id, stop_evt, pause_evt):
             result_q.task_done()
 
 # ─── Speed-test phase ─────────────────────────────────────────────────────────
+def is_private_host(host):
+    if host.lower() == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local
+
+def _probe_get(st, target, limit=2048):
+    st.write(_request("GET", target, target["path"], "Connection: close\r\n"))
+    status, hdrs, rest = _http_head(st, target)
+    body = _read_body(st, hdrs, rest, keep=limit)        # honors Content-Length / chunking: the server may keep the connection open
+    return status, body.decode("latin-1")
+
+def probe_url(ip, cfg, args, url):
+    """GET `url` through a tunnel over `ip` -> (status, text); (None, why) when it could not be fetched."""
+    try:
+        return run_in_tunnel(ip, cfg, args, parse_url(url), _probe_get)
+    except Exception as e:
+        return None, _note(e)
+
+def diagnose_test_server(ip, cfg, args, target):
+    """
+    Why can't the VPS reach the user's own test server? A few probes through the tunnel -> lines
+    of advice: the VPS's public IP (what Xray CAN connect to) and whether the server answers there.
+    """
+    host, port = target["host"], target["port"]
+    exit_ip = None
+    for url in ("https://1.1.1.1/cdn-cgi/trace", "https://www.cloudflare.com/cdn-cgi/trace"):
+        status, text = probe_url(ip, cfg, args, url)
+        m = re.search(r"^ip=(\S+)", text or "", re.M) if status == 200 else None
+        if m:
+            exit_ip = m.group(1)
+            break
+    lines = []
+    if is_private_host(host):
+        lines.append(f"{host} is a private address. Many Xray servers (3x-ui by default) block those with a routing rule "
+                     f"(geoip:private -> block), so the VPS hangs up at once.")
+    if not exit_ip:
+        lines.append("The VPS's public IP could not be found through the tunnel (https://1.1.1.1/cdn-cgi/trace did not answer).")
+        return lines
+    shown = f"[{exit_ip}]" if ":" in exit_ip else exit_ip
+    lines.append(f"Your VPS's public IP, as the internet sees it: {exit_ip}")
+    status, text = probe_url(ip, cfg, args, f"http://{shown}:{port}/")
+    if status is not None:
+        lines.append(f"{shown}:{port} answers (HTTP {status}). Run again with:")
+        lines.append(f'  --down-url "http://{shown}:{port}/down?bytes={{bytes}}" --up-url "http://{shown}:{port}/up"')
+    else:
+        lines.append(f"{shown}:{port} does not answer either ({text.replace(f'{shown}:{port} ', '', 1)}) - the server is not listening there.")
+        lines.append("Start it so it listens on all addresses (the default; a server bound to 127.0.0.1 only accepts connections to")
+        lines.append("127.0.0.1) and on a free port - port 80 needs root and is often taken by nginx/Caddy:")
+        lines.append("  python3 speedtest_server.py --port 8080")
+        lines.append(f'  --down-url "http://{shown}:8080/down?bytes={{bytes}}" --up-url "http://{shown}:8080/up"')
+    return lines
+
 def fmt_speed(v):
     return "    -" if v is None else f"{v:6.2f} Mbps ({v/8:5.2f} MB/s)"
 
@@ -1397,6 +1459,10 @@ def run_speed_test_phase(candidates, args, cfg):
                          f"{CW}That points at the TEST SERVER (or your VPS), not at the IPs - so these IPs were NOT judged and the run stops.{R}",
                          f"{CW}Is the server in --down-url reachable from your VPS? Is speedtest_server.py running there, and does your{R}",
                          f"{CW}Xray config block private addresses (then bind it to 0.0.0.0 and use the VPS's public IP)?{R}"]
+                own = sv.remaining("down")
+                if args.down_url and own and survivors == [] and candidates:
+                    print(f"\n  {CM}{B}▸ Finding out why your test server can't be reached…{R}")
+                    lines += [f"{CW}{l}{R}" for l in diagnose_test_server(candidates[0]["ip"], cfg, args, own[0])]
                 with refusal_lock:
                     host_refuses.set()
                     stop_notes.extend(lines)
@@ -1607,6 +1673,14 @@ def run(args):
                 f"(fast IPs looked slow, so almost nothing passed --min-download).{R}")
         warn_notes.append(note)
         print(f"  {note}")
+
+    for opt, url in (("--down-url", args.down_url), ("--up-url", args.up_url)):
+        if url and is_private_host(urllib.parse.urlsplit(url).hostname or ""):
+            note = (f"{CY}ℹ {opt} uses a private address ({urllib.parse.urlsplit(url).hostname}). The VPS opens that connection, "
+                    f"and many Xray servers (3x-ui by default) block private addresses. If every IP then fails with \"closed the "
+                    f"connection without answering\", the scanner finds your VPS's public IP and tells you what to use instead.{R}")
+            warn_notes.append(note)
+            print(f"  {note}")
 
     if args.tls13_only and not args.sni:
         print(f"  {CR}  --tls13-only requires -s/--sni{R}"); sys.exit(1)

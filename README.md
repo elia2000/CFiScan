@@ -158,7 +158,8 @@ several scans side by side.
 | `32 KB went out but <host> sent no reply in 5s` | The data left your PC but that upload server never answered — public servers often ignore datacenter IPs. Use your own server, see above |
 | `uplink stuck: only 16 of 32 KB went out in 5s` | The data does not even leave your PC through this IP: your uplink, or the path through this IP, is blocked or extremely slow |
 | `⚠ Upload tests switched OFF` | The upload test failed on 3 IPs in a row and never worked in this run; the warning lists what the IPs said — see above |
-| `N of N IPs failed the same way` | Nearly every IP fails identically: the test server (or your VPS) is the problem, not the IPs. The run stops and the IPs stay untested |
+| `N of N IPs failed the same way` | Nearly every IP fails identically: the test server (or your VPS) is the problem, not the IPs. The run stops, the IPs stay untested, and the scanner adds what it found out about your server |
+| `127.0.0.1:8080 closed the connection without answering` | The tunnel works, but the VPS did not (or could not) connect to that address: Xray blocks private addresses, nothing listens there, or the port is taken. Use the VPS's public IP (the scanner prints it), the default all-address server and a free port |
 | `No download test server answers your server` | Every speed-test server refused or was unreachable from your server. The text after each host is what it answered. Give `--down-url` a large file your server can fetch. The IPs stay **untested** |
 | `fake WS 101` | Something in the network is faking WebSocket replies |
 | Speeds still higher than V2rayN | V2rayN measures another URL and duration; other traffic on your line; try `--speed-time 10`. Compare IPs against each other, not the absolute value |
@@ -211,20 +212,28 @@ Cloudflare IP → your VPS*.
    `nohup python3 speedtest_server.py &`, or a systemd service):
 
    ```bash
-   python3 speedtest_server.py            # listens on 127.0.0.1:8080
+   python3 speedtest_server.py            # all addresses, port 8080
    ```
 
-2. On your PC, point the speed test at it:
+   It prints a line when it starts and one when the first connections arrive — if nothing arrives later, the
+   tunnel cannot reach it (see below). Use a free port above 1024: port 80 needs root and is often taken by nginx/Caddy.
+
+2. On your PC, point the speed test at it, with **your VPS's public IP** (`VPS_IP`):
 
    ```bash
    python3 cf_ping.py subnets.txt -c "vless://..." --speed-test \
-       --down-url "http://127.0.0.1:8080/down?bytes={bytes}" --up-url "http://127.0.0.1:8080/up"
+       --down-url "http://VPS_IP:8080/down?bytes={bytes}" --up-url "http://VPS_IP:8080/up"
    ```
 
-`127.0.0.1` is the VPS itself — the VPS opens that connection, not your PC. If your Xray config blocks private
-addresses (a common `geoip:private` → `block` rule), start the server with `--bind 0.0.0.0` and use the VPS's public IP
-in both URLs, and block that port from outside in your firewall (the server answers anybody). It does not measure the
-VPS → internet leg, which is the same for every Cloudflare IP anyway.
+**Why the public IP and not `127.0.0.1`:** the VPS opens that connection, and many Xray servers (3x-ui by default)
+block private and loopback destinations with a routing rule (`geoip:private` → `block`). Then every IP fails with
+`127.0.0.1:8080 closed the connection without answering`. The scanner notices this: it asks the tunnel for your VPS's
+public IP, probes it, and prints either the exact `--down-url` / `--up-url` to use or what to change on the server.
+
+**Is it safe to listen on all addresses?** Yes: the server answers **only connections made from the VPS itself** (that
+is where Xray connects from); everybody else gets `403 local clients only`. If your Xray runs in Docker with its own
+network and the connections appear to come from another address, start the server with `--allow-any` and restrict the
+port in your firewall instead. It does not measure the VPS → internet leg, which is the same for every Cloudflare IP.
 
 ### Your own file or another server
 
