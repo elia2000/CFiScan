@@ -5,3 +5,12 @@ __pycache__/
 cf_results.json
 cf_progress.json
 *.json.tmp
+
+# SNI search output (default names)
+sni_results.json
+sni_working.txt
+sni_spoof_config.json
+sni_best_links.txt
+
+# the sni-spoof-rs program is not part of this repository
+sni-spoof-rs*
