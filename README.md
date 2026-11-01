@@ -8,6 +8,7 @@ Finds Cloudflare IPs that really work **with your own VLESS + WebSocket (+TLS) c
 * Single file (`cf_ping.py`), **no dependencies** — Python 3.8+ standard library only
 * Works on **Windows** and **Linux** (macOS should work too)
 * Resume support, live dashboard, ready-to-import `vless://` links in the results
+* A second tool, **`sni_scan.py`**, finds the fastest **SNI** (for SNI spoofing) on your best IPs — see [SNI search](#sni-search-sni_scanpy--which-sni-is-fastest-and-on-which-ip)
 
 ---
 
@@ -248,6 +249,113 @@ python3 cf_ping.py subnets.txt -c "vless://..." --speed-test --down-url "https:/
 `--down-url` / `--up-url` force a single URL — no fallback. `--up-url` needs a server that accepts `POST` bodies.
 `your-server.invalid` above is a **placeholder** — replace it with a real file URL (the script refuses placeholder
 hosts such as `example.com`).
+
+---
+
+## SNI search (`sni_scan.py`) — which SNI is fastest, and on which IP?
+
+If your ISP uses DPI, the **SNI** (the server name sent in clear text at the start of every TLS connection) decides
+whether a connection is blocked, throttled or left alone — and the same SNI can behave differently on two Cloudflare
+IPs. [SNI spoofing](https://github.com/patterniha/SNI-Spoofing) (here through its Rust port
+[sni-spoof-rs](https://github.com/therealaleph/sni-spoofing-rust)) runs a small local forwarder that shows the DPI a
+**fake SNI** while your real TLS handshake (real SNI, Host, UUID) passes through unchanged. Which fake SNI you pick
+has a direct effect on your speed.
+
+`sni_scan.py` finds out **which fake SNI to use, and on which IP**. It takes the best IPs of `cf_ping.py`
+(`cf_results.json`) and a list of candidate SNIs (`sni_list.txt`, about 2 350 names, [credits](THIRD_PARTY.md)) and
+ranks every (IP, SNI) pair by the **real download and upload speed through your own VLESS tunnel** — the same
+measurement as above, not just "the handshake answered".
+
+```bash
+# 1. find good IPs first (see above) -> cf_results.json
+# 2. which SNIs get through at all?  No admin rights, no config needed; reads ./cf_results.json
+python3 sni_scan.py --mode reach
+# 3. the real ranking, through sni-spoof-rs (it needs root / Administrator for raw packets)
+sudo python3 sni_scan.py -c "vless://..." --spoof-bin ./sni-spoof-rs-linux-amd64
+```
+
+Windows (PowerShell **as Administrator**): `python sni_scan.py -c "vless://..." --spoof-bin .\sni-spoof-rs.exe`
+
+Download sni-spoof-rs from its [releases page](https://github.com/therealaleph/sni-spoofing-rust/releases/latest)
+(Windows: unzip it and keep the WinDivert files next to the `.exe`; Linux/macOS: `chmod +x` it). If it lies next to
+`sni_scan.py` the `--spoof-bin` option can be left out. `sni_scan.py` never downloads anything and only starts the
+program you point it to.
+
+### What it does
+
+| Stage | What happens | Cost |
+|---|---|---|
+| 1. Reach | Every SNI on every IP: a ClientHello with that SNI — byte for byte the packet sni-spoof-rs injects, like its own `scan` — is sent and the first reply byte is checked. `0x16` (ServerHello) = passed; `0x15` (alert) = the server refused that name but the DPI did not block it, which is enough for a *fake* SNI; reset / timeout = blocked | 2 000+ names × 5 IPs: minutes, 100 at a time |
+| 2. Probe | The SNIs that passed get a real download through your tunnel: a rough screen (~1 MB, 8 at a time), then an accurate probe of the best ones, one at a time. All SNIs are measured on the **same IP**, so the numbers compare SNIs, not IPs | seconds per SNI |
+| 3. Matrix | The best SNIs × **every IP they passed on**: full download and upload, one at a time. Your own SNI is measured on the same IPs as the baseline to beat | `--speed-time` per pair |
+
+This is what shows when an SNI works only on some IPs or is fast on one IP and slow on another: stage 1 prints
+`only on some IPs: … → 104.18.x.x`, and stage 3 measures each SNI on each IP it passed on.
+
+| `--mode` | What it does | Needs |
+|---|---|---|
+| `reach` | Stage 1 only: which SNIs pass on which IPs | nothing (default when `-c` is missing) |
+| `spoof` | Stages 1–3 **through sni-spoof-rs**: one listener per (IP, SNI) pair — the DPI sees the fake SNI, Cloudflare sees yours | `-c`, sni-spoof-rs, root / Administrator (default when `--spoof-bin` is given) |
+| `direct` | Stages 1–3 with the candidate as the **real** SNI. Cloudflare normally refuses a request whose SNI and Host differ (`HTTP 403`) — then the tool tells you to use `spoof` instead | `-c` (default when `-c` is given without `--spoof-bin`) |
+
+### Output
+
+* The console: best (IP, SNI) pairs, best SNIs overall (median over the IPs), and the best pair against your own SNI.
+* `sni_results.json` — everything: stage-1 outcome of every pair, rough screen, probes, matrix, ranking.
+* `sni_working.txt` — SNIs that passed, best first (same format as `sni-spoof-rs scan -o`).
+* `sni_spoof_config.json` — a ready config for sni-spoof-rs with the three best pairs (local ports 40443, 40444, 40445).
+* `sni_best_links.txt` — the matching `vless://` links.
+
+To use the result:
+
+```bash
+sudo ./sni-spoof-rs-linux-amd64 sni_spoof_config.json     # Windows: as Administrator; leave it running
+# then import one link from sni_best_links.txt (V2rayN: Servers -> Import from clipboard)
+```
+
+The links point to `127.0.0.1:40443…` (sni-spoof-rs) and keep your real SNI, Host, path and UUID.
+
+### Options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-c`, `--config` | – | your `vless://` link (needed for every speed measurement) |
+| `--ips`, `--ips-file`, `--ips-from` | `./cf_results.json` | IPs to test: comma list, file with one IP per line, or the `cf_results.json` of `cf_ping.py` (verified IPs first) |
+| `--top` | `5` | how many IPs are taken from the results file |
+| `--snis` | `sni_list.txt` | candidate names, one per line (`#` = comment) |
+| `--max-snis` | all | only the first N names (the list starts with the best-known ones) |
+| `--mode` | automatic | `reach`, `direct` or `spoof` (see above) |
+| `--spoof-bin` | automatic | path of sni-spoof-rs (found by itself when it lies next to the script, in the current folder or on `PATH`) |
+| `-t`, `--threads` / `-w`, `--wait` | `100` / `4` | stage-1 parallelism / timeout per probe and step (seconds) |
+| `--max-probe` | `300` | how many of the SNIs that passed get the rough 1 MB screen (`0` = all of them) |
+| `--probe-snis` / `--probe-time` | `30` / `3` | how many go on to the accurate probe / its length in seconds |
+| `--top-snis` | `6` | best SNIs that go to the IP × SNI matrix |
+| `--speed-time` | `5` | seconds per full download / upload measurement |
+| `--min-download`, `--min-upload` | `1` / `0.5` | Mbps; slower pairs are dropped early |
+| `--no-upload`, `--no-baseline` | off | skip the upload test / don't measure your own SNI as the reference |
+| `--down-url`, `--up-url` | automatic | same as in `cf_ping.py` — see *Test against your own server* |
+| `--sort` | `download` | `download`, `upload` or `delay` |
+| `-o` | `sni_results.json` | results file (the other files are written next to it) |
+
+### Good to know
+
+* **The list** (`sni_list.txt`) holds candidates only: part 1 is the best-known names (tried first with
+  `--max-snis`), part 2 sites that are on Cloudflare (they work in both modes), part 3 names that are **not** on
+  Cloudflare — Iranian sites, big tech — which only make sense as a fake SNI in `spoof` mode (in `direct` mode stage 1
+  drops them). Add your own names anywhere; duplicates are ignored.
+* **Time:** the full list on 5 IPs takes minutes in stage 1. Use `--max-snis 300` for a first look, `-w 6` on a slow
+  line, `--max-probe 0` when you want every passing name speed-tested.
+* **Each number is one measurement.** Pairs within about 20 % of each other are a tie; repeat the finalists
+  (`--top-snis 3`), also at another time of the day, before trusting a small difference.
+* Passing stage 1 only means the DPI did not block the name. Whether it is also **fast** is what stages 2 and 3 measure.
+* **Results belong to your ISP and the time of day.** A list that works on one network may not work on another.
+* If stage 1 looks fine but every pair fails afterwards, run sni-spoof-rs by hand first (see its README): missing
+  root / Administrator, WinDivert files, an antivirus or another VPN capturing packets. The tool prints the log line
+  `timeout waiting for fake ACK` when it sees it.
+* The packet injection is sni-spoof-rs's job; `sni_scan.py` writes its config, starts it, measures through its
+  listeners and stops it again when it ends or on Ctrl+C. If the scan is killed hard, a leftover `sni-spoof-rs` may
+  keep running — end it in Task Manager (Windows) or with `pkill sni-spoof-rs`.
+* Like the scanner, it measures **VLESS over WebSocket** only.
 
 ## Limitations
 
